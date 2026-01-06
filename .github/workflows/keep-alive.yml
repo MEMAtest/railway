@@ -1,0 +1,22 @@
+name: Keep Darwin Backend Alive
+
+on:
+  schedule:
+    # Run every 10 minutes
+    - cron: '*/10 * * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Darwin Backend
+        run: |
+          echo "Pinging Darwin backend..."
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://railway-tlmc.onrender.com/health || echo "000")
+          echo "Response: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "Backend is alive!"
+          else
+            echo "Backend may be waking up (status: $HTTP_STATUS)"
+          fi

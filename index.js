@@ -66,7 +66,43 @@ const CONFIG = {
         'PNGEW': 'Penge West',
         'PENGEWT': 'Penge West',
         'PNGEE': 'Penge East',
-        'PENGEET': 'Penge East'
+        'PENGEET': 'Penge East',
+        // Common destinations
+        'VICTRIC': 'Victoria',
+        'VICTRIA': 'Victoria',
+        'LNDNBDE': 'London Bridge',
+        'LONBDGE': 'London Bridge',
+        'CHRX': 'Charing Cross',
+        'CHARING': 'Charing Cross',
+        'CANNON': 'Cannon Street',
+        'CANNS': 'Cannon Street',
+        'ORPNGTN': 'Orpington',
+        'ORPINTN': 'Orpington',
+        'BCKJN': 'Beckenham Jct',
+        'BNKCHSX': 'Beckenham Jct',
+        'WIMBLDN': 'Wimbledon',
+        'WMBLEDN': 'Wimbledon',
+        'CRYSTLP': 'Crystal Palace',
+        'HGHBYIS': 'Highbury & Islington',
+        'WCROYDN': 'West Croydon',
+        'CATFORD': 'Catford',
+        'HAYES': 'Hayes',
+        'BROMLEY': 'Bromley South',
+        'BICKLEY': 'Bickley',
+        'STNBS': 'St Johns',
+        'ELTNHMR': 'Eltham',
+        'GRWICH': 'Greenwich',
+        'BLKHTH': 'Blackheath',
+        'LEWISHM': 'Lewisham',
+        'LADWELL': 'Ladywell',
+        'CTFDBGE': 'Catford Bridge',
+        'BELNGHM': 'Bellingham',
+        'BCKHMJN': 'Beckenham Jct',
+        'RAVPRKS': 'Ravensbourne',
+        'SHORTLD': 'Shortlands',
+        'BRMLYNS': 'Bromley North',
+        'SNDRSTD': 'Sanderstead',
+        'NRWD JN': 'Norwood Jct'
     }
 };
 
@@ -505,16 +541,32 @@ app.get('/api/debug/stations', (req, res) => {
  * Format departures for API response
  */
 function formatDepartures(deps) {
-    return deps.map(d => ({
-        destination: d.destination || 'Unknown',
-        scheduledTime: d.ptd || d.wtd,
-        expectedTime: d.dep,
-        platform: d.plat || '-',
-        mins: d.mins,
-        cancelled: d.cancelled || false,
-        delayed: d.delayed || false,
-        lateReason: d.lateReason
-    }));
+    return deps.map(d => {
+        // Extract platform number - Darwin can send it as object or string
+        let platform = '-';
+        if (d.plat) {
+            if (typeof d.plat === 'string') {
+                platform = d.plat;
+            } else if (typeof d.plat === 'object') {
+                // Darwin sends platform as object like {platsrc: "A", conf: "true", "": "2"}
+                platform = d.plat[''] || d.plat.plat || Object.values(d.plat).find(v => /^[0-9]+$/.test(v)) || '-';
+            }
+        }
+
+        // Format destination from TIPLOC
+        const destName = CONFIG.stationNames[d.destination] || d.destination || 'Unknown';
+
+        return {
+            destination: destName,
+            scheduledTime: d.ptd || d.wtd,
+            expectedTime: typeof d.dep === 'object' ? d.dep?.at : d.dep,
+            platform: platform,
+            mins: d.mins,
+            cancelled: d.cancelled || false,
+            delayed: d.delayed || false,
+            lateReason: d.lateReason
+        };
+    });
 }
 
 // ============================================

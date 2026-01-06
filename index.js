@@ -1,0 +1,540 @@
+/**
+ * Darwin Train Data Backend
+ * Consumes National Rail Darwin Push Port (Kafka) and serves departure data via REST API
+ */
+
+const express = require('express');
+const cors = require('cors');
+const { Kafka } = require('kafkajs');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// ============================================
+// CONFIGURATION
+// ============================================
+const CONFIG = {
+    // Darwin Kafka credentials
+    kafka: {
+        brokers: ['pkc-z3p1v0.europe-west2.gcp.confluent.cloud:9092'],
+        sasl: {
+            mechanism: 'plain',
+            username: 'DX2TUIY2J7VV7JU4',
+            password: 'cflto5Fc8uXfjuSq3ILrEGARa2IQtFQhp1mqBhrNWWAKCpuiRp0qGFv2imN3OwDg'
+        },
+        ssl: true,
+        groupId: 'SC-989188c0-5e4a-49fd-98e6-767a0ba6a66c'
+    },
+    topic: 'prod-1010-Darwin-Train-Information-Push-Port-IIII2_0-JSON',
+
+    // Stations to monitor - both TIPLOC and CRS codes
+    // TIPLOC codes are typically 7 chars, derived from station name
+    stations: {
+        // CRS codes
+        'PNW': { name: 'Penge West', line: 'Southern', crs: 'PNW' },
+        'PNE': { name: 'Penge East', line: 'Southeastern', crs: 'PNE' },
+        'BKB': { name: 'Birkbeck', line: 'Tram', crs: 'BKB' },
+        'ANR': { name: 'Anerley', line: 'Overground', crs: 'ANR' },
+        // Actual TIPLOC codes from Darwin data
+        'ANERLEY': { name: 'Anerley', line: 'Overground', crs: 'ANR' },
+        'BKBY': { name: 'Birkbeck', line: 'Tram', crs: 'BKB' },
+        'PNGEW': { name: 'Penge West', line: 'Southern', crs: 'PNW' },
+        'PENGEWT': { name: 'Penge West', line: 'Southern', crs: 'PNW' },
+        'PNGEE': { name: 'Penge East', line: 'Southeastern', crs: 'PNE' },
+        'PENGEET': { name: 'Penge East', line: 'Southeastern', crs: 'PNE' }
+    },
+
+    // Map TIPLOC to CRS for storage
+    // Based on actual Darwin data: ANERLEY, BKBY are the real codes
+    toCRS: {
+        // Actual Darwin TIPLOC codes
+        'ANERLEY': 'ANR',
+        'BKBY': 'BKB',  // Birkbeck actual TIPLOC
+        'PNGEW': 'PNW',
+        'PENGEWT': 'PNW',
+        'PNGEE': 'PNE',
+        'PENGEET': 'PNE',
+        // CRS codes (fallback)
+        'PNW': 'PNW', 'PNE': 'PNE', 'BKB': 'BKB', 'ANR': 'ANR'
+    },
+
+    // Station name lookup by TIPLOC
+    stationNames: {
+        'ANERLEY': 'Anerley',
+        'BKBY': 'Birkbeck',
+        'PNGEW': 'Penge West',
+        'PENGEWT': 'Penge West',
+        'PNGEE': 'Penge East',
+        'PENGEET': 'Penge East'
+    }
+};
+
+// ============================================
+// IN-MEMORY STORE FOR DEPARTURES
+// ============================================
+const departures = {
+    PNW: [],
+    PNE: [],
+    BKB: [],
+    ANR: []
+};
+
+// Store service messages (delays, cancellations)
+const serviceMessages = [];
+
+// Debug: store recent station codes seen
+const recentStations = new Set();
+const sampleMessages = [];
+
+// Last update timestamp
+let lastUpdate = null;
+let kafkaConnected = false;
+let messageCount = 0;
+
+// ============================================
+// KAFKA CONSUMER
+// ============================================
+const kafka = new Kafka({
+    clientId: 'penge-dash-consumer',
+    brokers: CONFIG.kafka.brokers,
+    ssl: true,
+    sasl: {
+        mechanism: CONFIG.kafka.sasl.mechanism,
+        username: CONFIG.kafka.sasl.username,
+        password: CONFIG.kafka.sasl.password
+    },
+    connectionTimeout: 10000,
+    requestTimeout: 30000
+});
+
+const consumer = kafka.consumer({ groupId: CONFIG.kafka.groupId });
+
+/**
+ * Process incoming Darwin messages
+ * Darwin Push Port messages have train data inside a 'bytes' field as JSON string
+ */
+function processDarwinMessage(message) {
+    try {
+        const wrapper = JSON.parse(message.value.toString());
+        messageCount++;
+
+        // The actual data is inside the 'bytes' field as a JSON string
+        if (!wrapper.bytes) return;
+
+        const data = JSON.parse(wrapper.bytes);
+
+        // Store sample messages for debugging (keep last 5)
+        if (sampleMessages.length < 5) {
+            sampleMessages.push({
+                keys: Object.keys(data),
+                hasUR: !!data.uR,
+                hasTS: data.uR ? !!data.uR.TS : false,
+                sample: JSON.stringify(data).substring(0, 800)
+            });
+        }
+
+        // Process uR (update) messages
+        if (data.uR) {
+            // Handle Train Status updates
+            if (data.uR.TS) {
+                const tsArray = Array.isArray(data.uR.TS) ? data.uR.TS : [data.uR.TS];
+                tsArray.forEach(ts => processTrainStatus(ts));
+            }
+
+            // Handle schedule updates
+            if (data.uR.schedule) {
+                const schedArray = Array.isArray(data.uR.schedule) ? data.uR.schedule : [data.uR.schedule];
+                schedArray.forEach(s => processSchedule(s));
+            }
+
+            // Handle station messages (OW)
+            if (data.uR.OW) {
+                const owArray = Array.isArray(data.uR.OW) ? data.uR.OW : [data.uR.OW];
+                owArray.forEach(ow => processStationMessage(ow));
+            }
+        }
+
+        lastUpdate = new Date();
+    } catch (error) {
+        // Silently ignore parse errors
+    }
+}
+
+/**
+ * Process Train Status (TS) messages
+ * Contains real-time running information
+ */
+function processTrainStatus(ts) {
+    if (!ts.LateReason && !ts.Location) return;
+
+    // Extract locations this train is calling at
+    const locations = Array.isArray(ts.Location) ? ts.Location : [ts.Location];
+
+    locations.forEach(loc => {
+        if (!loc) return;
+
+        const stationCode = loc.tpl; // TIPLOC code
+
+        // Track all stations for debugging
+        if (stationCode) {
+            recentStations.add(stationCode);
+        }
+
+        // Check if this is one of our monitored stations (by TIPLOC or CRS)
+        const crsCode = CONFIG.toCRS[stationCode];
+        if (crsCode) {
+            updateDeparture(stationCode, {
+                rid: ts.rid, // Unique train ID
+                uid: ts.uid,
+                ssd: ts.ssd, // Scheduled start date
+                tpl: stationCode,
+                pta: loc.pta, // Public time of arrival
+                ptd: loc.ptd, // Public time of departure
+                wta: loc.wta, // Working time of arrival
+                wtd: loc.wtd, // Working time of departure
+                arr: loc.arr, // Actual/estimated arrival
+                dep: loc.dep, // Actual/estimated departure
+                plat: loc.plat, // Platform
+                cancelled: loc.can === 'true',
+                delayed: ts.LateReason ? true : false,
+                lateReason: ts.LateReason
+            });
+        }
+    });
+}
+
+/**
+ * Process Schedule messages
+ * Contains timetable information for trains
+ */
+function processSchedule(schedule) {
+    if (!schedule.OR && !schedule.IP && !schedule.DT) return;
+
+    // Get all calling points
+    const callingPoints = [
+        ...(schedule.OR ? [schedule.OR] : []),
+        ...(schedule.IP ? (Array.isArray(schedule.IP) ? schedule.IP : [schedule.IP]) : []),
+        ...(schedule.DT ? [schedule.DT] : [])
+    ];
+
+    callingPoints.forEach(point => {
+        if (!point || !point.tpl) return;
+
+        const stationCode = point.tpl;
+
+        // Track all stations for debugging
+        if (stationCode) {
+            recentStations.add(stationCode);
+        }
+
+        // Check if this is one of our monitored stations
+        const crsCode = CONFIG.toCRS[stationCode];
+        if (crsCode) {
+            updateDeparture(stationCode, {
+                rid: schedule.rid,
+                uid: schedule.uid,
+                ssd: schedule.ssd,
+                tpl: stationCode,
+                trainId: schedule.trainId,
+                toc: schedule.toc, // Train operating company
+                pta: point.pta,
+                ptd: point.ptd,
+                wta: point.wta,
+                wtd: point.wtd,
+                plat: point.plat,
+                activity: point.act,
+                destination: getDestination(schedule)
+            });
+        }
+    });
+}
+
+/**
+ * Get final destination from schedule
+ */
+function getDestination(schedule) {
+    if (schedule.DT && schedule.DT.tpl) {
+        return schedule.DT.tpl;
+    }
+    return null;
+}
+
+/**
+ * Process station messages (alerts, announcements)
+ */
+function processStationMessage(ow) {
+    if (!ow.Station) return;
+
+    const stations = Array.isArray(ow.Station) ? ow.Station : [ow.Station];
+
+    stations.forEach(station => {
+        if (CONFIG.stations[station.crs]) {
+            serviceMessages.push({
+                station: station.crs,
+                message: ow.Msg,
+                severity: ow.Severity,
+                timestamp: new Date()
+            });
+
+            // Keep only last 20 messages
+            if (serviceMessages.length > 20) {
+                serviceMessages.shift();
+            }
+        }
+    });
+}
+
+/**
+ * Update departure information for a station
+ */
+function updateDeparture(stationCode, trainData) {
+    // Convert TIPLOC to CRS for storage
+    const crsCode = CONFIG.toCRS[stationCode] || stationCode;
+    const stationDepartures = departures[crsCode];
+    if (!stationDepartures) return;
+
+    // Add station info
+    trainData.stationCode = crsCode;
+    trainData.stationName = CONFIG.stations[stationCode]?.name || crsCode;
+
+    // Find existing entry for this train
+    const existingIndex = stationDepartures.findIndex(d => d.rid === trainData.rid);
+
+    // Calculate minutes until departure
+    const departureTime = trainData.ptd || trainData.wtd || trainData.dep;
+    if (departureTime) {
+        trainData.mins = calculateMinutes(departureTime);
+    }
+
+    if (existingIndex >= 0) {
+        // Update existing
+        stationDepartures[existingIndex] = {
+            ...stationDepartures[existingIndex],
+            ...trainData,
+            updatedAt: new Date()
+        };
+    } else {
+        // Add new
+        stationDepartures.push({
+            ...trainData,
+            createdAt: new Date(),
+            updatedAt: new Date()
+        });
+    }
+
+    // Sort by departure time and keep only next 10
+    stationDepartures.sort((a, b) => {
+        const timeA = a.ptd || a.wtd || '99:99';
+        const timeB = b.ptd || b.wtd || '99:99';
+        return timeA.localeCompare(timeB);
+    });
+
+    // Remove past departures and keep only next 10
+    const now = new Date();
+    departures[stationCode] = stationDepartures
+        .filter(d => {
+            if (d.mins !== undefined && d.mins < -2) return false; // Already departed
+            return true;
+        })
+        .slice(0, 10);
+}
+
+/**
+ * Calculate minutes from now until given time (HH:MM format)
+ */
+function calculateMinutes(timeStr) {
+    if (!timeStr) return null;
+
+    const [hours, mins] = timeStr.split(':').map(Number);
+    const now = new Date();
+    const target = new Date();
+    target.setHours(hours, mins, 0, 0);
+
+    // Handle times past midnight
+    if (target < now && hours < 6) {
+        target.setDate(target.getDate() + 1);
+    }
+
+    return Math.round((target - now) / 60000);
+}
+
+/**
+ * Start Kafka consumer
+ */
+async function startKafkaConsumer() {
+    try {
+        console.log('Connecting to Darwin Kafka...');
+        await consumer.connect();
+        console.log('Connected! Subscribing to topic...');
+
+        await consumer.subscribe({
+            topic: CONFIG.topic,
+            fromBeginning: false
+        });
+
+        console.log('Subscribed! Starting consumer...');
+
+        await consumer.run({
+            eachMessage: async ({ topic, partition, message }) => {
+                processDarwinMessage(message);
+            }
+        });
+
+        kafkaConnected = true;
+        console.log('Darwin Kafka consumer running!');
+
+    } catch (error) {
+        console.error('Failed to start Kafka consumer:', error.message);
+        kafkaConnected = false;
+
+        // Retry after 30 seconds
+        setTimeout(startKafkaConsumer, 30000);
+    }
+}
+
+// ============================================
+// REST API ENDPOINTS
+// ============================================
+
+// Health check
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        kafkaConnected,
+        lastUpdate,
+        messageCount,
+        stationsMonitored: Object.keys(CONFIG.stations)
+    });
+});
+
+// Get all departures for all stations
+app.get('/api/departures', (req, res) => {
+    const response = {};
+
+    Object.keys(departures).forEach(station => {
+        response[station] = {
+            name: CONFIG.stations[station].name,
+            line: CONFIG.stations[station].line,
+            departures: formatDepartures(departures[station])
+        };
+    });
+
+    res.json({
+        timestamp: new Date(),
+        lastUpdate,
+        stations: response
+    });
+});
+
+// Get departures for a specific station
+app.get('/api/departures/:station', (req, res) => {
+    const station = req.params.station.toUpperCase();
+
+    if (!CONFIG.stations[station]) {
+        return res.status(404).json({ error: 'Station not found' });
+    }
+
+    res.json({
+        timestamp: new Date(),
+        lastUpdate,
+        station: {
+            code: station,
+            name: CONFIG.stations[station].name,
+            line: CONFIG.stations[station].line,
+            departures: formatDepartures(departures[station])
+        }
+    });
+});
+
+// Get service messages/alerts
+app.get('/api/messages', (req, res) => {
+    res.json({
+        timestamp: new Date(),
+        messages: serviceMessages
+    });
+});
+
+// Get status (for debugging)
+app.get('/api/status', (req, res) => {
+    res.json({
+        kafkaConnected,
+        lastUpdate,
+        messageCount,
+        departuresCount: {
+            PNW: departures.PNW.length,
+            PNE: departures.PNE.length,
+            BKB: departures.BKB.length,
+            ANR: departures.ANR.length
+        }
+    });
+});
+
+// Debug endpoint - see sample messages
+app.get('/api/debug/samples', (req, res) => {
+    res.json({
+        messageCount,
+        sampleMessages
+    });
+});
+
+// Debug endpoint - see what stations are coming through
+app.get('/api/debug/stations', (req, res) => {
+    // Filter for stations that might be Penge-related
+    const allStations = Array.from(recentStations).sort();
+    const pengeRelated = allStations.filter(s =>
+        s.toLowerCase().includes('png') ||
+        s.toLowerCase().includes('peng') ||
+        s.toLowerCase().includes('aner') ||
+        s.toLowerCase().includes('birk') ||
+        s.toLowerCase().includes('anr') ||
+        s.toLowerCase().includes('pnw') ||
+        s.toLowerCase().includes('pne') ||
+        s.toLowerCase().includes('bkb')
+    );
+
+    res.json({
+        totalStationsSeen: allStations.length,
+        pengeRelated,
+        allStations: allStations.slice(0, 200), // First 200 stations
+        monitoredCodes: Object.keys(CONFIG.toCRS)
+    });
+});
+
+/**
+ * Format departures for API response
+ */
+function formatDepartures(deps) {
+    return deps.map(d => ({
+        destination: d.destination || 'Unknown',
+        scheduledTime: d.ptd || d.wtd,
+        expectedTime: d.dep,
+        platform: d.plat || '-',
+        mins: d.mins,
+        cancelled: d.cancelled || false,
+        delayed: d.delayed || false,
+        lateReason: d.lateReason
+    }));
+}
+
+// ============================================
+// START SERVER
+// ============================================
+const PORT = process.env.PORT || 10000; // Render uses port 10000 by default
+
+app.listen(PORT, () => {
+    console.log(`Darwin API server running on port ${PORT}`);
+    console.log(`Monitoring stations: ${Object.keys(CONFIG.stations).join(', ')}`);
+
+    // Start Kafka consumer
+    startKafkaConsumer();
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+    console.log('Shutting down...');
+    await consumer.disconnect();
+    process.exit(0);
+});
+
+module.exports = app;

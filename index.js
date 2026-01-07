@@ -241,7 +241,34 @@ const CONFIG = {
         'GRNGWOD': 'Gravel Hill',
         'ADNGTNV': 'Addington Village',
         'KING HY': 'King Henrys Drive',
-        'NEWADNG': 'New Addington'
+        'NEWADNG': 'New Addington',
+        // Additional from debug
+        'THBDGS': 'Theobalds Grove',
+        'GRVRBGJ': 'Grove Park',
+        'GROVEPK': 'Grove Park',
+        'GRVPKJN': 'Grove Park',
+        'GRAVSND': 'Gravesend',
+        'GRVSEND': 'Gravesend',
+        'DARTFRD': 'Dartford',
+        'DARTFD': 'Dartford',
+        'GILLGM': 'Gillingham',
+        'GILNGHM': 'Gillingham',
+        'RAINHM': 'Rainham',
+        'SLADE': 'Slade Green',
+        'SLDEGRN': 'Slade Green',
+        'ELTHAMW': 'Eltham Well Hall',
+        'KIDBRKE': 'Kidbrooke',
+        'CHARLTN': 'Charlton',
+        'WOLWCHA': 'Woolwich Arsenal',
+        'WOLWCHD': 'Woolwich Dockyard',
+        'ABYWOOD': 'Abbey Wood',
+        'ABBEYW': 'Abbey Wood',
+        'BELVDER': 'Belvedere',
+        'ERITH': 'Erith',
+        'BARNHRS': 'Barnehurst',
+        'BEXLEYH': 'Bexleyheath',
+        'WELLING': 'Welling',
+        'FALCONW': 'Falconwood'
     }
 };
 

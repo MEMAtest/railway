@@ -152,7 +152,96 @@ const CONFIG = {
         'NUNHEAD': 'Nunhead',
         'CROFTON': 'Crofton Park',
         'ECROYDN': 'East Croydon',
-        'EASTCRY': 'East Croydon'
+        'EASTCRY': 'East Croydon',
+        // Overground destinations
+        'HGHI': 'Highbury & Islington',
+        'HIGHBIS': 'Highbury & Islington',
+        'HIGHBYI': 'Highbury & Islington',
+        'WCROYDO': 'West Croydon',
+        'WESTCRO': 'West Croydon',
+        'WSTCRDN': 'West Croydon',
+        // More London terminals
+        'EUSTON': 'Euston',
+        'EUSTNMS': 'Euston',
+        'STPX': 'St Pancras',
+        'STPANCI': 'St Pancras',
+        'STPANCR': 'St Pancras',
+        'KNGX': 'Kings Cross',
+        'KGXMSLS': 'Kings Cross',
+        'KNGSCRS': 'Kings Cross',
+        'LIVST': 'Liverpool Street',
+        'LIVSTLL': 'Liverpool Street',
+        'LVRPLST': 'Liverpool Street',
+        'WATRLMN': 'Waterloo',
+        'WATERLM': 'Waterloo',
+        'WATERLE': 'Waterloo',
+        'PADTON': 'Paddington',
+        'PADTONL': 'Paddington',
+        'PADDNTN': 'Paddington',
+        'FENCHST': 'Fenchurch Street',
+        'FENCHRC': 'Fenchurch Street',
+        'MRGT': 'Moorgate',
+        'MOORGAT': 'Moorgate',
+        // South London
+        'CLPHMJN': 'Clapham Junction',
+        'CLPHMJC': 'Clapham Junction',
+        'CLAPHMJ': 'Clapham Junction',
+        'BATRSEA': 'Battersea Park',
+        'BATSPK': 'Battersea Park',
+        'PCKHMQS': 'Peckham Queens Road',
+        'QNSRDPK': 'Queens Road Peckham',
+        'BERMSEY': 'Bermondsey',
+        'CWATERJ': 'Canada Water',
+        'CANWATE': 'Canada Water',
+        'SURQYS': 'Surrey Quays',
+        'SUREYQY': 'Surrey Quays',
+        'ROTHRTH': 'Rotherhithe',
+        'WAPING': 'Wapping',
+        'WAPPING': 'Wapping',
+        'SHADWEL': 'Shadwell',
+        'WHTCHPL': 'Whitechapel',
+        'WHTECHP': 'Whitechapel',
+        'SHOREDH': 'Shoreditch High Street',
+        'SHRDHST': 'Shoreditch High Street',
+        'HOXTN': 'Hoxton',
+        'HOXTON': 'Hoxton',
+        'HGGRSTN': 'Haggerston',
+        'DALSTNK': 'Dalston Kingsland',
+        'DALSKNG': 'Dalston Kingsland',
+        'DALSTJN': 'Dalston Junction',
+        'DALSJN': 'Dalston Junction',
+        'CNNONBY': 'Canonbury',
+        'CANONBY': 'Canonbury',
+        // Croydon area
+        'NRWDJCT': 'Norwood Junction',
+        'CRDONCS': 'Croydon Central',
+        'STHCROY': 'South Croydon',
+        'PURLEY': 'Purley',
+        'PURLEYO': 'Purley Oaks',
+        'SANDRST': 'Sanderstead',
+        'RIDDLSD': 'Riddlesdown',
+        'UPPERWA': 'Upper Warlingham',
+        'WARLNGH': 'Warlingham',
+        'WHYTELF': 'Whyteleafe',
+        'CATHAMS': 'Caterham',
+        // Tram destinations
+        'ELMERSD': 'Elmers End',
+        'ELMERSE': 'Elmers End',
+        'BECKROD': 'Beckenham Road',
+        'BCKROAD': 'Beckenham Road',
+        'AVENUE': 'Avenue Road',
+        'AVENURD': 'Avenue Road',
+        'WOODSID': 'Woodside',
+        'BLKHRSE': 'Blackhorse Lane',
+        'ADDSCMB': 'Addiscombe',
+        'ADDISCO': 'Addiscombe',
+        'LLOYD': 'Lloyd Park',
+        'LLYDPRK': 'Lloyd Park',
+        'COOMBE': 'Coombe Lane',
+        'GRNGWOD': 'Gravel Hill',
+        'ADNGTNV': 'Addington Village',
+        'KING HY': 'King Henrys Drive',
+        'NEWADNG': 'New Addington'
     }
 };
 
@@ -257,6 +346,10 @@ function processTrainStatus(ts) {
     // Extract locations this train is calling at
     const locations = Array.isArray(ts.Location) ? ts.Location : [ts.Location];
 
+    // Find the final destination (last location in the array)
+    const validLocations = locations.filter(l => l && l.tpl);
+    const finalDestination = validLocations.length > 0 ? validLocations[validLocations.length - 1].tpl : null;
+
     locations.forEach(loc => {
         if (!loc) return;
 
@@ -284,7 +377,8 @@ function processTrainStatus(ts) {
                 plat: loc.plat, // Platform
                 cancelled: loc.can === 'true',
                 delayed: ts.LateReason ? true : false,
-                lateReason: ts.LateReason
+                lateReason: ts.LateReason,
+                destination: finalDestination // Add final destination from TS message
             });
         }
     });
@@ -584,6 +678,23 @@ app.get('/api/debug/stations', (req, res) => {
         pengeRelated,
         allStations: allStations.slice(0, 200), // First 200 stations
         monitoredCodes: Object.keys(CONFIG.toCRS)
+    });
+});
+
+// Debug endpoint - see raw departures with TIPLOCs
+app.get('/api/debug/raw', (req, res) => {
+    const rawData = {};
+    Object.keys(departures).forEach(station => {
+        rawData[station] = departures[station].map(d => ({
+            destination: d.destination,
+            resolvedName: CONFIG.stationNames[d.destination] || 'Unknown',
+            scheduledTime: d.ptd || d.wtd,
+            platform: d.plat
+        }));
+    });
+    res.json({
+        rawData,
+        knownMappings: Object.keys(CONFIG.stationNames).length
     });
 });
 

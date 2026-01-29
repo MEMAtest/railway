@@ -539,7 +539,7 @@ function updateDeparture(stationCode, trainData) {
 
     // Remove past departures and keep only next 10
     const now = new Date();
-    departures[stationCode] = stationDepartures
+    departures[crsCode] = stationDepartures
         .filter(d => {
             if (d.mins !== undefined && d.mins < -2) return false; // Already departed
             return true;
@@ -737,7 +737,10 @@ function formatDepartures(deps) {
                 platform = d.plat;
             } else if (typeof d.plat === 'object') {
                 // Darwin sends platform as object like {platsrc: "A", conf: "true", "": "2"}
-                platform = d.plat[''] || d.plat.plat || Object.values(d.plat).find(v => /^[0-9]+$/.test(v)) || '-';
+                // or {platsrc: "P", cisPlatsup: "true", "": "1"}
+                // The actual platform value is in the empty string key or 'plat' key
+                platform = d.plat[''] || d.plat.plat ||
+                    Object.values(d.plat).find(v => typeof v === 'string' && /^[0-9]+[A-Za-z]?$|^[A-Za-z]$/.test(v)) || '-';
             }
         }
 

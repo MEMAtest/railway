@@ -28,6 +28,14 @@ const CONFIG = {
     },
     topic: 'prod-1010-Darwin-Train-Information-Push-Port-IIII2_0-JSON',
 
+    // Walking time in minutes from home to each station
+    walkingTimes: {
+        'PNW': 4,   // Penge West
+        'PNE': 5,   // Penge East
+        'ANR': 7,   // Anerley
+        'BKB': 10   // Birkbeck
+    },
+
     // Stations to monitor - both TIPLOC and CRS codes
     // TIPLOC codes are typically 7 chars, derived from station name
     stations: {
@@ -623,7 +631,8 @@ app.get('/api/departures', (req, res) => {
         response[station] = {
             name: CONFIG.stations[station].name,
             line: CONFIG.stations[station].line,
-            departures: formatDepartures(departures[station])
+            walkMins: CONFIG.walkingTimes[station] || null,
+            departures: formatDepartures(departures[station], station)
         };
     });
 
@@ -649,8 +658,85 @@ app.get('/api/departures/:station', (req, res) => {
             code: station,
             name: CONFIG.stations[station].name,
             line: CONFIG.stations[station].line,
-            departures: formatDepartures(departures[station])
+            walkMins: CONFIG.walkingTimes[station] || null,
+            departures: formatDepartures(departures[station], station)
         }
+    });
+});
+
+// Journey planner - find trains to a destination with leave-by times
+app.get('/api/journey/:destination', (req, res) => {
+    const query = req.params.destination.toLowerCase().replace(/[^a-z0-9 ]/g, '');
+
+    // Build a reverse lookup: destination name -> TIPLOC codes
+    const matchingTiplocs = new Set();
+    Object.entries(CONFIG.stationNames).forEach(([tiploc, name]) => {
+        if (name.toLowerCase().includes(query)) {
+            matchingTiplocs.add(tiploc);
+        }
+    });
+
+    if (matchingTiplocs.size === 0) {
+        return res.status(404).json({
+            error: 'Destination not found',
+            hint: 'Try a partial name like "victoria", "london bridge", "crystal palace"'
+        });
+    }
+
+    const matchedName = CONFIG.stationNames[matchingTiplocs.values().next().value];
+
+    // Search all stations for trains heading to this destination
+    const options = [];
+    Object.entries(departures).forEach(([crsCode, deps]) => {
+        const walkMins = CONFIG.walkingTimes[crsCode] || 5;
+        const stationInfo = CONFIG.stations[crsCode];
+
+        deps.forEach(d => {
+            if (!matchingTiplocs.has(d.destination)) return;
+            if (d.cancelled) return;
+
+            const scheduledTime = d.ptd || d.wtd;
+            if (!scheduledTime) return;
+
+            const minsUntilDeparture = calculateMinutes(scheduledTime);
+            if (minsUntilDeparture === null || minsUntilDeparture < -1) return;
+
+            const leaveInMins = minsUntilDeparture - walkMins;
+
+            // Extract platform
+            let platform = '-';
+            if (d.plat) {
+                if (typeof d.plat === 'string') {
+                    platform = d.plat;
+                } else if (typeof d.plat === 'object') {
+                    platform = d.plat[''] || d.plat.plat ||
+                        Object.values(d.plat).find(v => typeof v === 'string' && /^[0-9]+[A-Za-z]?$|^[A-Za-z]$/.test(v)) || '-';
+                }
+            }
+
+            options.push({
+                station: stationInfo?.name || crsCode,
+                stationCode: crsCode,
+                line: stationInfo?.line || '-',
+                walkMins,
+                scheduledTime,
+                expectedTime: typeof d.dep === 'object' ? d.dep?.at : d.dep,
+                platform,
+                leaveInMins,
+                delayed: d.delayed || false,
+                lateReason: d.lateReason
+            });
+        });
+    });
+
+    // Sort by leaveInMins so the most urgent option is first
+    options.sort((a, b) => a.leaveInMins - b.leaveInMins);
+
+    res.json({
+        timestamp: new Date(),
+        lastUpdate,
+        destination: matchedName,
+        options
     });
 });
 
@@ -728,7 +814,8 @@ app.get('/api/debug/raw', (req, res) => {
 /**
  * Format departures for API response
  */
-function formatDepartures(deps) {
+function formatDepartures(deps, crsCode) {
+    const walkMins = crsCode ? (CONFIG.walkingTimes[crsCode] || 5) : null;
     return deps.map(d => {
         // Extract platform number - Darwin can send it as object or string
         let platform = '-';
@@ -747,12 +834,16 @@ function formatDepartures(deps) {
         // Format destination from TIPLOC
         const destName = CONFIG.stationNames[d.destination] || d.destination || 'Unknown';
 
+        const minsUntilDeparture = calculateMinutes(d.ptd || d.wtd);
+
         return {
             destination: destName,
             scheduledTime: d.ptd || d.wtd,
             expectedTime: typeof d.dep === 'object' ? d.dep?.at : d.dep,
             platform: platform,
             mins: d.mins,
+            walkMins: walkMins,
+            leaveInMins: (minsUntilDeparture !== null && walkMins !== null) ? minsUntilDeparture - walkMins : null,
             cancelled: d.cancelled || false,
             delayed: d.delayed || false,
             lateReason: d.lateReason

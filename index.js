@@ -574,18 +574,23 @@ function updateDeparture(stationCode, trainData) {
 }
 
 /**
- * Calculate minutes from now until given time (HH:MM format)
+ * Calculate minutes from now until given time (HH:MM or HH:MM:SS format)
  */
 function calculateMinutes(timeStr) {
     if (!timeStr) return null;
 
-    const [hours, mins] = timeStr.split(':').map(Number);
+    const parts = timeStr.split(':').map(Number);
+    const hours = parts[0];
+    const mins = parts[1];
     const now = new Date();
     const target = new Date();
     target.setHours(hours, mins, 0, 0);
 
-    // Handle times past midnight
-    if (target < now && hours < 6) {
+    // Handle times that appear to be in the past - likely tomorrow's train
+    const diffMs = target - now;
+    const diffHours = diffMs / (1000 * 60 * 60);
+
+    if (diffHours < -12) {
         target.setDate(target.getDate() + 1);
     }
 
@@ -863,12 +868,12 @@ app.get('/api/best/:destination', (req, res) => {
             if (!scheduledTime) return;
 
             const minsUntilDeparture = calculateMinutes(scheduledTime);
-            if (minsUntilDeparture === null || minsUntilDeparture < 0) return;
+            if (minsUntilDeparture === null) return;
+
+            // Allow trains up to 3 mins past scheduled (platform delays happen)
+            if (minsUntilDeparture < -3) return;
 
             const leaveInMins = minsUntilDeparture - walkMins;
-
-            // Skip if already too late to catch
-            if (leaveInMins < -2) return;
 
             // Extract platform
             let platform = '-';
@@ -939,10 +944,19 @@ app.get('/api/best/:destination', (req, res) => {
         alternative: options.find(o => o.line !== best.line && lineStatus[o.line]?.status !== 'disrupted')
     } : null;
 
+    // Status message for edge cases
+    let status = 'ok';
+    if (options.length === 0) {
+        status = 'no_trains';
+    } else if (catchableOptions.length === 0) {
+        status = 'all_departed';
+    }
+
     res.json({
         timestamp: new Date(),
         lastUpdate,
         destination: matchedName,
+        status,
         best,
         departureWindow,
         disruption,

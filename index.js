@@ -600,13 +600,14 @@ async function fetchOvergroundStatus() {
         const response = await fetch('https://api.tfl.gov.uk/Line/london-overground/Status');
         const data = await response.json();
 
-        if (data && data[0] && data[0].lineStatuses) {
+        if (data && data[0] && data[0].lineStatuses && data[0].lineStatuses[0]) {
             const status = data[0].lineStatuses[0];
-            const isGood = status.statusSeverity === 10; // 10 = Good Service
+            const sev = status.statusSeverity;
+            const isGood = sev === 10 || sev === 18 || sev === 19; // Good Service, No Issues, Information
 
             lineStatus['Overground'] = {
                 status: isGood ? 'good' : 'disrupted',
-                severity: status.statusSeverity,
+                severity: sev,
                 message: isGood ? null : status.reason || status.statusSeverityDescription,
                 updatedAt: new Date()
             };
@@ -626,14 +627,27 @@ function updateLineStatusFromMessage(station, message, severity) {
     const line = stationInfo.line;
     if (!lineStatus[line]) return;
 
-    // Severity 0-2 are serious issues
-    const isDisrupted = severity <= 2 ||
-        /delay|cancel|disrupt|suspend|close/i.test(message);
+    const sev = typeof severity === 'number' ? severity : 10;
+
+    // Check for disruption patterns
+    const isDisrupted = sev <= 2 ||
+        /delay|cancel|disrupt|suspend|close|reduced|strike|industrial|divert|block|bus replacement/i.test(message);
+
+    // Check for good service patterns
+    const isGoodService = /good service|normal service|service resumed|running normally/i.test(message);
 
     if (isDisrupted) {
         lineStatus[line] = {
             status: 'disrupted',
+            severity: sev,
             message: message,
+            updatedAt: new Date()
+        };
+    } else if (isGoodService) {
+        lineStatus[line] = {
+            status: 'good',
+            severity: 10,
+            message: null,
             updatedAt: new Date()
         };
     }
@@ -711,8 +725,9 @@ app.get('/api/departures', (req, res) => {
 // Get departures for a specific station
 app.get('/api/departures/:station', (req, res) => {
     const station = req.params.station.toUpperCase();
+    const crsCode = CONFIG.toCRS[station] || station;
 
-    if (!CONFIG.stations[station]) {
+    if (!CONFIG.stations[station] || !departures[crsCode]) {
         return res.status(404).json({ error: 'Station not found' });
     }
 
@@ -720,11 +735,11 @@ app.get('/api/departures/:station', (req, res) => {
         timestamp: new Date(),
         lastUpdate,
         station: {
-            code: station,
+            code: crsCode,
             name: CONFIG.stations[station].name,
             line: CONFIG.stations[station].line,
-            walkMins: CONFIG.walkingTimes[station] || null,
-            departures: formatDepartures(departures[station], station)
+            walkMins: CONFIG.walkingTimes[crsCode] || null,
+            departures: formatDepartures(departures[crsCode], crsCode)
         }
     });
 });
@@ -748,7 +763,8 @@ app.get('/api/journey/:destination', (req, res) => {
         });
     }
 
-    const matchedName = CONFIG.stationNames[matchingTiplocs.values().next().value];
+    const firstTiploc = matchingTiplocs.values().next().value;
+    const matchedName = CONFIG.stationNames[firstTiploc] || firstTiploc;
 
     // Search all stations for trains heading to this destination
     const options = [];
@@ -828,7 +844,8 @@ app.get('/api/best/:destination', (req, res) => {
         });
     }
 
-    const matchedName = CONFIG.stationNames[matchingTiplocs.values().next().value];
+    const firstTiploc = matchingTiplocs.values().next().value;
+    const matchedName = CONFIG.stationNames[firstTiploc] || firstTiploc;
 
     // Gather all options with scoring
     const options = [];
@@ -868,9 +885,18 @@ app.get('/api/best/:destination', (req, res) => {
             // Base score is minutes until you need to leave (negative = already late)
             let score = leaveInMins < 0 ? 1000 : leaveInMins;
 
-            // Penalties
-            if (lineState.status === 'disrupted') score += 30; // Avoid disrupted lines
-            if (d.delayed) score += 15; // Penalize delayed trains
+            // Penalties - scaled by severity
+            if (lineState.status === 'disrupted') {
+                // TfL severity: 1-5 = severe (40 penalty), 6-8 = moderate (20), 9 = minor (10)
+                const sev = lineState.severity ?? 5;
+                const disruptionPenalty = sev <= 5 ? 40 : (sev <= 8 ? 20 : 10);
+                score += disruptionPenalty;
+            }
+            // Scale delay penalty - try to extract minutes from reason
+            if (d.delayed) {
+                const delayMatch = d.lateReason?.match(/(\d+)\s*min/i);
+                score += delayMatch ? Math.min(parseInt(delayMatch[1]), 30) : 15;
+            }
             if (leaveInMins < 2 && leaveInMins >= 0) score -= 5; // Slight bonus for "leave now" options
 
             options.push({
@@ -1007,6 +1033,7 @@ app.get('/api/debug/raw', (req, res) => {
  * Format departures for API response
  */
 function formatDepartures(deps, crsCode) {
+    if (!deps || !Array.isArray(deps)) return [];
     const walkMins = crsCode ? (CONFIG.walkingTimes[crsCode] || 5) : null;
     return deps.map(d => {
         // Extract platform number - Darwin can send it as object or string
@@ -1058,6 +1085,20 @@ app.listen(PORT, () => {
     // Fetch TfL Overground status immediately and every 2 minutes
     fetchOvergroundStatus();
     setInterval(fetchOvergroundStatus, 2 * 60 * 1000);
+
+    // Auto-decay stale disruption status (clear after 30 mins if no updates)
+    setInterval(() => {
+        const now = Date.now();
+        const DECAY_MS = 30 * 60 * 1000;
+        Object.keys(lineStatus).forEach(line => {
+            const ls = lineStatus[line];
+            if (ls.status === 'disrupted' && ls.updatedAt &&
+                now - ls.updatedAt.getTime() > DECAY_MS) {
+                lineStatus[line] = { status: 'good', message: null, updatedAt: new Date() };
+                console.log(`Auto-cleared stale disruption on ${line}`);
+            }
+        });
+    }, 5 * 60 * 1000);
 });
 
 // Graceful shutdown

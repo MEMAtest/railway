@@ -165,7 +165,9 @@ const CONFIG = {
         'NEWX': 'New Cross',
         'SURREYQ': 'Surrey Quays',
         'DENMARKH': 'Denmark Hill',
+        'DNMKHL': 'Denmark Hill',
         'PCKHMRY': 'Peckham Rye',
+        'PCKMRYE': 'Peckham Rye',
         'NUNHEAD': 'Nunhead',
         'CROFTON': 'Crofton Park',
         'ECROYDN': 'East Croydon',
@@ -314,7 +316,10 @@ const lineStatus = {
 const DESTINATIONS = {
     'victoria': ['VICTRIC', 'VICTRIA', 'VICTRIE', 'VICTRI'],
     'london bridge': ['LNDNBDE', 'LNDNBDG', 'LONBDGE', 'LONDONB'],
-    'crystal palace': ['CRYSTLP', 'CRYSTPL', 'CRSTLPL']
+    'crystal palace': ['CRYSTLP', 'CRYSTPL', 'CRSTLPL'],
+    'beckenham junction': ['BCKHMJN', 'BCKNHMJ', 'BCKJN'],
+    'denmark hill': ['DNMKHL', 'DENMRKH'],
+    'peckham rye': ['PCKHMRY', 'PCKMRYE']
 };
 
 // Platform exit positioning advice
@@ -330,12 +335,21 @@ const EXIT_POSITIONING = {
         'ANR': { carriage: 'middle', exit: 'barriers', note: 'Middle for main exit' }
     },
     'crystal palace': {
-        'PNW': { carriage: 'middle', exit: 'station', note: 'Middle carriages for exit ramp' },
-        'ANR': { carriage: 'middle', exit: 'station', note: 'Middle carriages for exit ramp' }
+        'PNW': { carriage: 'any', exit: 'lift', note: 'Exit via lifts to concourse above - position less important' },
+        'ANR': { carriage: 'any', exit: 'lift', note: 'Exit via lifts to concourse above - position less important' }
     },
     'east croydon': {
         'PNW': { carriage: 'middle', exit: 'barriers', note: 'Middle for ticket barriers' },
         'ANR': { carriage: 'front', exit: 'barriers', note: 'Front for main exit' }
+    },
+    'beckenham junction': {
+        'PNE': { carriage: 'front', exit: 'tram', note: 'Front carriages for tram platforms' }
+    },
+    'denmark hill': {
+        'ANR': { carriage: 'rear', exit: 'thameslink', note: 'Rear for Thameslink platforms' }
+    },
+    'peckham rye': {
+        'ANR': { carriage: 'middle', exit: 'interchange', note: 'Middle for Southern/Southeastern interchange' }
     }
 };
 
@@ -385,6 +399,16 @@ const CONNECTION_STATS = {
     },
     'crystal palace': {
         'bus': { walkMins: 2, successRate: { tight: 90, normal: 98 } }
+    },
+    'beckenham junction': {
+        'tram': { walkMins: 3, successRate: { tight: 80, normal: 95 } }
+    },
+    'denmark hill': {
+        'thameslink': { walkMins: 2, successRate: { tight: 85, normal: 97 } }
+    },
+    'peckham rye': {
+        'southern': { walkMins: 2, successRate: { tight: 88, normal: 97 } },
+        'southeastern': { walkMins: 2, successRate: { tight: 88, normal: 97 } }
     }
 };
 

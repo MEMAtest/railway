@@ -293,6 +293,21 @@ const departures = {
 // Store service messages (delays, cancellations)
 const serviceMessages = [];
 
+// Track line disruptions
+const lineStatus = {
+    'Southern': { status: 'good', message: null, updatedAt: null },
+    'Southeastern': { status: 'good', message: null, updatedAt: null },
+    'Overground': { status: 'good', message: null, updatedAt: null },
+    'Tram': { status: 'good', message: null, updatedAt: null }
+};
+
+// Common destinations with their TIPLOC codes
+const DESTINATIONS = {
+    'victoria': ['VICTRIC', 'VICTRIA', 'VICTRIE', 'VICTRI'],
+    'london bridge': ['LNDNBDE', 'LNDNBDG', 'LONBDGE', 'LONDONB'],
+    'crystal palace': ['CRYSTLP', 'CRYSTPL', 'CRSTLPL']
+};
+
 // Debug: store recent station codes seen
 const recentStations = new Set();
 const sampleMessages = [];
@@ -492,6 +507,9 @@ function processStationMessage(ow) {
                 timestamp: new Date()
             });
 
+            // Update line status based on message
+            updateLineStatusFromMessage(station.crs, ow.Msg, ow.Severity);
+
             // Keep only last 20 messages
             if (serviceMessages.length > 20) {
                 serviceMessages.shift();
@@ -572,6 +590,53 @@ function calculateMinutes(timeStr) {
     }
 
     return Math.round((target - now) / 60000);
+}
+
+/**
+ * Fetch TfL Overground status
+ */
+async function fetchOvergroundStatus() {
+    try {
+        const response = await fetch('https://api.tfl.gov.uk/Line/london-overground/Status');
+        const data = await response.json();
+
+        if (data && data[0] && data[0].lineStatuses) {
+            const status = data[0].lineStatuses[0];
+            const isGood = status.statusSeverity === 10; // 10 = Good Service
+
+            lineStatus['Overground'] = {
+                status: isGood ? 'good' : 'disrupted',
+                severity: status.statusSeverity,
+                message: isGood ? null : status.reason || status.statusSeverityDescription,
+                updatedAt: new Date()
+            };
+        }
+    } catch (error) {
+        console.error('Failed to fetch TfL status:', error.message);
+    }
+}
+
+/**
+ * Update line status from Darwin messages
+ */
+function updateLineStatusFromMessage(station, message, severity) {
+    const stationInfo = CONFIG.stations[station];
+    if (!stationInfo) return;
+
+    const line = stationInfo.line;
+    if (!lineStatus[line]) return;
+
+    // Severity 0-2 are serious issues
+    const isDisrupted = severity <= 2 ||
+        /delay|cancel|disrupt|suspend|close/i.test(message);
+
+    if (isDisrupted) {
+        lineStatus[line] = {
+            status: 'disrupted',
+            message: message,
+            updatedAt: new Date()
+        };
+    }
 }
 
 /**
@@ -740,6 +805,133 @@ app.get('/api/journey/:destination', (req, res) => {
     });
 });
 
+// Best Option Now - smart recommendation considering disruptions
+app.get('/api/best/:destination', (req, res) => {
+    const query = req.params.destination.toLowerCase().replace(/[^a-z0-9 ]/g, '');
+
+    // Use predefined destinations or search
+    let matchingTiplocs = new Set();
+    if (DESTINATIONS[query]) {
+        DESTINATIONS[query].forEach(t => matchingTiplocs.add(t));
+    } else {
+        Object.entries(CONFIG.stationNames).forEach(([tiploc, name]) => {
+            if (name.toLowerCase().includes(query)) {
+                matchingTiplocs.add(tiploc);
+            }
+        });
+    }
+
+    if (matchingTiplocs.size === 0) {
+        return res.status(404).json({
+            error: 'Destination not found',
+            hint: 'Try: victoria, london bridge, crystal palace'
+        });
+    }
+
+    const matchedName = CONFIG.stationNames[matchingTiplocs.values().next().value];
+
+    // Gather all options with scoring
+    const options = [];
+    Object.entries(departures).forEach(([crsCode, deps]) => {
+        const walkMins = CONFIG.walkingTimes[crsCode] || 5;
+        const stationInfo = CONFIG.stations[crsCode];
+        const line = stationInfo?.line;
+        const lineState = lineStatus[line] || { status: 'good' };
+
+        deps.forEach(d => {
+            if (!matchingTiplocs.has(d.destination)) return;
+            if (d.cancelled) return;
+
+            const scheduledTime = d.ptd || d.wtd;
+            if (!scheduledTime) return;
+
+            const minsUntilDeparture = calculateMinutes(scheduledTime);
+            if (minsUntilDeparture === null || minsUntilDeparture < 0) return;
+
+            const leaveInMins = minsUntilDeparture - walkMins;
+
+            // Skip if already too late to catch
+            if (leaveInMins < -2) return;
+
+            // Extract platform
+            let platform = '-';
+            if (d.plat) {
+                if (typeof d.plat === 'string') {
+                    platform = d.plat;
+                } else if (typeof d.plat === 'object') {
+                    platform = d.plat[''] || d.plat.plat ||
+                        Object.values(d.plat).find(v => typeof v === 'string' && /^[0-9]+[A-Za-z]?$|^[A-Za-z]$/.test(v)) || '-';
+                }
+            }
+
+            // Score: lower is better
+            // Base score is minutes until you need to leave (negative = already late)
+            let score = leaveInMins < 0 ? 1000 : leaveInMins;
+
+            // Penalties
+            if (lineState.status === 'disrupted') score += 30; // Avoid disrupted lines
+            if (d.delayed) score += 15; // Penalize delayed trains
+            if (leaveInMins < 2 && leaveInMins >= 0) score -= 5; // Slight bonus for "leave now" options
+
+            options.push({
+                station: stationInfo?.name || crsCode,
+                stationCode: crsCode,
+                line: line || '-',
+                lineStatus: lineState.status,
+                lineMessage: lineState.message,
+                walkMins,
+                scheduledTime,
+                expectedTime: typeof d.dep === 'object' ? d.dep?.at : d.dep,
+                platform,
+                leaveInMins,
+                catchable: leaveInMins >= 0,
+                delayed: d.delayed || false,
+                lateReason: d.lateReason,
+                score
+            });
+        });
+    });
+
+    // Sort by score (best first)
+    options.sort((a, b) => a.score - b.score);
+
+    // Best option
+    const best = options[0] || null;
+
+    // Calculate departure window (range of leave times for next few options)
+    const catchableOptions = options.filter(o => o.catchable).slice(0, 5);
+    const departureWindow = catchableOptions.length > 1 ? {
+        leaveFrom: Math.max(0, Math.min(...catchableOptions.map(o => o.leaveInMins))),
+        leaveTo: Math.max(...catchableOptions.map(o => o.leaveInMins)),
+        trainCount: catchableOptions.length
+    } : null;
+
+    // Check for disruption affecting best route
+    const disruption = best && lineStatus[best.line]?.status === 'disrupted' ? {
+        line: best.line,
+        message: lineStatus[best.line].message,
+        alternative: options.find(o => o.line !== best.line && lineStatus[o.line]?.status !== 'disrupted')
+    } : null;
+
+    res.json({
+        timestamp: new Date(),
+        lastUpdate,
+        destination: matchedName,
+        best,
+        departureWindow,
+        disruption,
+        alternatives: options.slice(1, 4) // Next 3 options
+    });
+});
+
+// Line status endpoint
+app.get('/api/status/lines', (req, res) => {
+    res.json({
+        timestamp: new Date(),
+        lines: lineStatus
+    });
+});
+
 // Get service messages/alerts
 app.get('/api/messages', (req, res) => {
     res.json({
@@ -862,6 +1054,10 @@ app.listen(PORT, () => {
 
     // Start Kafka consumer
     startKafkaConsumer();
+
+    // Fetch TfL Overground status immediately and every 2 minutes
+    fetchOvergroundStatus();
+    setInterval(fetchOvergroundStatus, 2 * 60 * 1000);
 });
 
 // Graceful shutdown

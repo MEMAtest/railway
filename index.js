@@ -308,6 +308,68 @@ const DESTINATIONS = {
     'crystal palace': ['CRYSTLP', 'CRYSTPL', 'CRSTLPL']
 };
 
+// Platform exit positioning advice
+// Which carriage to board for quickest exit at destination
+const EXIT_POSITIONING = {
+    'victoria': {
+        'PNE': { carriage: 'front', exit: 'barriers', note: 'Front 2 carriages for main exit' },
+        'PNW': { carriage: 'middle', exit: 'barriers', note: 'Middle carriages for main concourse' }
+    },
+    'london bridge': {
+        'PNE': { carriage: 'rear', exit: 'jubilee', note: 'Rear for Jubilee line, front for Northern' },
+        'PNW': { carriage: 'front', exit: 'northern', note: 'Front carriages for Northern line' },
+        'ANR': { carriage: 'middle', exit: 'barriers', note: 'Middle for main exit' }
+    },
+    'crystal palace': {
+        'PNW': { carriage: 'rear', exit: 'station', note: 'Rear carriage nearest exit' },
+        'ANR': { carriage: 'front', exit: 'station', note: 'Front carriage nearest exit' }
+    },
+    'east croydon': {
+        'PNW': { carriage: 'middle', exit: 'barriers', note: 'Middle for ticket barriers' },
+        'ANR': { carriage: 'front', exit: 'barriers', note: 'Front for main exit' }
+    }
+};
+
+// Crowding patterns by hour and day (0=Sun, 1=Mon, etc.)
+// Scale: 1=quiet, 2=moderate, 3=busy, 4=packed
+const crowdingPatterns = {
+    'PNE': {
+        peak: { weekday: [7, 8, 9, 17, 18, 19], level: 4 },
+        moderate: { weekday: [6, 10, 16, 20], level: 2 },
+        quiet: { level: 1 }
+    },
+    'PNW': {
+        peak: { weekday: [7, 8, 9, 17, 18, 19], level: 3 },
+        moderate: { weekday: [6, 10, 16, 20], level: 2 },
+        quiet: { level: 1 }
+    },
+    'ANR': {
+        peak: { weekday: [8, 9, 17, 18], level: 3 },
+        moderate: { weekday: [7, 10, 16, 19], level: 2 },
+        quiet: { level: 1 }
+    },
+    'BKB': {
+        peak: { weekday: [8, 9, 17, 18], level: 2 },
+        quiet: { level: 1 }
+    }
+};
+
+// Connection success rates at interchange stations (based on typical timings)
+const CONNECTION_STATS = {
+    'london bridge': {
+        'jubilee': { walkMins: 4, successRate: { tight: 70, normal: 95 } },
+        'northern': { walkMins: 3, successRate: { tight: 80, normal: 98 } }
+    },
+    'victoria': {
+        'district': { walkMins: 5, successRate: { tight: 65, normal: 90 } },
+        'circle': { walkMins: 5, successRate: { tight: 65, normal: 90 } },
+        'victoria_line': { walkMins: 4, successRate: { tight: 75, normal: 95 } }
+    },
+    'east croydon': {
+        'platform_change': { walkMins: 3, successRate: { tight: 85, normal: 98 } }
+    }
+};
+
 // Debug: store recent station codes seen
 const recentStations = new Set();
 const sampleMessages = [];
@@ -595,6 +657,52 @@ function calculateMinutes(timeStr) {
     }
 
     return Math.round((target - now) / 60000);
+}
+
+/**
+ * Get crowding prediction for a station at a given time
+ */
+function getCrowdingLevel(stationCode, date = new Date()) {
+    const patterns = crowdingPatterns[stationCode];
+    if (!patterns) return { level: 1, label: 'unknown' };
+
+    const hour = date.getHours();
+    const day = date.getDay();
+    const isWeekday = day >= 1 && day <= 5;
+
+    if (isWeekday && patterns.peak?.weekday?.includes(hour)) {
+        return { level: patterns.peak.level, label: 'busy' };
+    }
+    if (isWeekday && patterns.moderate?.weekday?.includes(hour)) {
+        return { level: patterns.moderate.level, label: 'moderate' };
+    }
+    return { level: patterns.quiet?.level || 1, label: 'quiet' };
+}
+
+/**
+ * Get connection risk for an interchange
+ */
+function getConnectionRisk(destination, connectionLine, bufferMins) {
+    const destKey = destination.toLowerCase();
+    const stats = CONNECTION_STATS[destKey]?.[connectionLine];
+    if (!stats) return null;
+
+    const isTight = bufferMins <= stats.walkMins + 2;
+    return {
+        walkMins: stats.walkMins,
+        bufferMins,
+        isTight,
+        successRate: isTight ? stats.successRate.tight : stats.successRate.normal,
+        recommendation: isTight ? 'Allow extra time or take earlier train' : 'Should make connection'
+    };
+}
+
+/**
+ * Get exit positioning advice
+ */
+function getExitAdvice(destination, fromStation) {
+    const destKey = destination.toLowerCase();
+    return EXIT_POSITIONING[destKey]?.[fromStation] || null;
 }
 
 /**
@@ -904,6 +1012,12 @@ app.get('/api/best/:destination', (req, res) => {
             }
             if (leaveInMins < 2 && leaveInMins >= 0) score -= 5; // Slight bonus for "leave now" options
 
+            // Get crowding prediction
+            const crowding = getCrowdingLevel(crsCode);
+
+            // Get exit positioning advice
+            const exitAdvice = getExitAdvice(matchedName, crsCode);
+
             options.push({
                 station: stationInfo?.name || crsCode,
                 stationCode: crsCode,
@@ -918,6 +1032,8 @@ app.get('/api/best/:destination', (req, res) => {
                 catchable: leaveInMins >= 0,
                 delayed: d.delayed || false,
                 lateReason: d.lateReason,
+                crowding,
+                exitAdvice,
                 score
             });
         });
@@ -944,6 +1060,11 @@ app.get('/api/best/:destination', (req, res) => {
         alternative: options.find(o => o.line !== best.line && lineStatus[o.line]?.status !== 'disrupted')
     } : null;
 
+    // Find quieter alternative if best option is busy
+    const quieterOption = best?.crowding?.level >= 3
+        ? options.find(o => o !== best && o.catchable && o.crowding?.level < best.crowding.level)
+        : null;
+
     // Status message for edge cases
     let status = 'ok';
     if (options.length === 0) {
@@ -960,6 +1081,7 @@ app.get('/api/best/:destination', (req, res) => {
         best,
         departureWindow,
         disruption,
+        quieterOption,
         alternatives: options.slice(1, 4) // Next 3 options
     });
 });
@@ -969,6 +1091,60 @@ app.get('/api/status/lines', (req, res) => {
     res.json({
         timestamp: new Date(),
         lines: lineStatus
+    });
+});
+
+// Connection risk calculator
+// e.g., /api/connection/london-bridge/jubilee?buffer=5
+app.get('/api/connection/:station/:line', (req, res) => {
+    const station = req.params.station.replace(/-/g, ' ');
+    const line = req.params.line.toLowerCase().replace(/-/g, '_');
+    const bufferMins = parseInt(req.query.buffer) || 6;
+
+    const risk = getConnectionRisk(station, line, bufferMins);
+
+    if (!risk) {
+        return res.status(404).json({
+            error: 'Connection not found',
+            hint: 'Try: /api/connection/london-bridge/jubilee?buffer=5'
+        });
+    }
+
+    res.json({
+        timestamp: new Date(),
+        station,
+        connection: line,
+        ...risk
+    });
+});
+
+// Crowding prediction endpoint
+app.get('/api/crowding/:station', (req, res) => {
+    const station = req.params.station.toUpperCase();
+    const crsCode = CONFIG.toCRS[station] || station;
+
+    if (!crowdingPatterns[crsCode]) {
+        return res.status(404).json({ error: 'Station not found' });
+    }
+
+    // Get predictions for next few hours
+    const now = new Date();
+    const predictions = [];
+    for (let i = 0; i < 6; i++) {
+        const time = new Date(now.getTime() + i * 60 * 60 * 1000);
+        const crowding = getCrowdingLevel(crsCode, time);
+        predictions.push({
+            hour: time.getHours(),
+            time: `${time.getHours().toString().padStart(2, '0')}:00`,
+            ...crowding
+        });
+    }
+
+    res.json({
+        timestamp: new Date(),
+        station: CONFIG.stations[crsCode]?.name || crsCode,
+        current: getCrowdingLevel(crsCode),
+        predictions
     });
 });
 

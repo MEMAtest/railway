@@ -28,12 +28,21 @@ const CONFIG = {
     },
     topic: 'prod-1010-Darwin-Train-Information-Push-Port-IIII2_0-JSON',
 
-    // Walking time in minutes from home to each station
+    // Travel times in minutes from home to each station
+    // walk = normal pace, brisk = fast walk, run = light jog
+    travelTimes: {
+        'PNW': { walk: 4, brisk: 3, run: 2 },
+        'PNE': { walk: 5, brisk: 4, run: 3 },
+        'ANR': { walk: 11, brisk: 9, run: 7 },
+        'BKB': { walk: 14, brisk: 11, run: 8 }
+    },
+
+    // Backwards compat - default to walk
     walkingTimes: {
-        'PNW': 4,   // Penge West
-        'PNE': 5,   // Penge East
-        'ANR': 7,   // Anerley
-        'BKB': 10   // Birkbeck
+        'PNW': 4,
+        'PNE': 5,
+        'ANR': 11,
+        'BKB': 14
     },
 
     // Stations to monitor - both TIPLOC and CRS codes
@@ -321,8 +330,8 @@ const EXIT_POSITIONING = {
         'ANR': { carriage: 'middle', exit: 'barriers', note: 'Middle for main exit' }
     },
     'crystal palace': {
-        'PNW': { carriage: 'rear', exit: 'station', note: 'Rear carriage nearest exit' },
-        'ANR': { carriage: 'front', exit: 'station', note: 'Front carriage nearest exit' }
+        'PNW': { carriage: 'middle', exit: 'station', note: 'Middle carriages for exit ramp' },
+        'ANR': { carriage: 'middle', exit: 'station', note: 'Middle carriages for exit ramp' }
     },
     'east croydon': {
         'PNW': { carriage: 'middle', exit: 'barriers', note: 'Middle for ticket barriers' },
@@ -334,39 +343,48 @@ const EXIT_POSITIONING = {
 // Scale: 1=quiet, 2=moderate, 3=busy, 4=packed
 const crowdingPatterns = {
     'PNE': {
-        peak: { weekday: [7, 8, 9, 17, 18, 19], level: 4 },
+        peak: { weekday: [7, 8, 9, 17, 18, 19], weekend: [11, 12, 17, 18], level: 4 },
         moderate: { weekday: [6, 10, 16, 20], level: 2 },
         quiet: { level: 1 }
     },
     'PNW': {
-        peak: { weekday: [7, 8, 9, 17, 18, 19], level: 3 },
+        peak: { weekday: [7, 8, 9, 17, 18, 19], weekend: [11, 12, 13, 14, 15], level: 3 },
         moderate: { weekday: [6, 10, 16, 20], level: 2 },
         quiet: { level: 1 }
     },
     'ANR': {
-        peak: { weekday: [8, 9, 17, 18], level: 3 },
-        moderate: { weekday: [7, 10, 16, 19], level: 2 },
+        peak: { weekday: [7, 8, 9, 17, 18], weekend: [12, 13, 17, 18], level: 3 },
+        moderate: { weekday: [6, 10, 16, 19], level: 2 },
         quiet: { level: 1 }
     },
     'BKB': {
-        peak: { weekday: [8, 9, 17, 18], level: 2 },
+        peak: { weekday: [8, 9, 15, 16, 17, 18], level: 2 },
         quiet: { level: 1 }
     }
 };
 
-// Connection success rates at interchange stations (based on typical timings)
+// Connection success rates at interchange stations
+// Walk times are realistic worst-case; success rates based on typical experience
 const CONNECTION_STATS = {
     'london bridge': {
-        'jubilee': { walkMins: 4, successRate: { tight: 70, normal: 95 } },
-        'northern': { walkMins: 3, successRate: { tight: 80, normal: 98 } }
+        'jubilee': { walkMins: 6, successRate: { tight: 65, normal: 92 } },
+        'northern': { walkMins: 4, successRate: { tight: 75, normal: 95 } },
+        'elizabeth': { walkMins: 5, successRate: { tight: 70, normal: 93 } }
     },
     'victoria': {
-        'district': { walkMins: 5, successRate: { tight: 65, normal: 90 } },
-        'circle': { walkMins: 5, successRate: { tight: 65, normal: 90 } },
-        'victoria_line': { walkMins: 4, successRate: { tight: 75, normal: 95 } }
+        'district': { walkMins: 6, successRate: { tight: 60, normal: 88 } },
+        'circle': { walkMins: 6, successRate: { tight: 60, normal: 88 } },
+        'victoria_line': { walkMins: 7, successRate: { tight: 55, normal: 82 } }
     },
     'east croydon': {
-        'platform_change': { walkMins: 3, successRate: { tight: 85, normal: 98 } }
+        'platform_change': { walkMins: 4, successRate: { tight: 80, normal: 95 } },
+        'thameslink': { walkMins: 3, successRate: { tight: 85, normal: 97 } }
+    },
+    'clapham junction': {
+        'platform_change': { walkMins: 5, successRate: { tight: 70, normal: 90 } }
+    },
+    'crystal palace': {
+        'bus': { walkMins: 2, successRate: { tight: 90, normal: 98 } }
     }
 };
 
@@ -663,12 +681,23 @@ function calculateMinutes(timeStr) {
  * Get crowding prediction for a station at a given time
  */
 function getCrowdingLevel(stationCode, date = new Date()) {
+    // Validate date input
+    if (!date || !(date instanceof Date) || isNaN(date.getTime())) {
+        date = new Date();
+    }
+
     const patterns = crowdingPatterns[stationCode];
     if (!patterns) return { level: 1, label: 'unknown' };
 
     const hour = date.getHours();
     const day = date.getDay();
     const isWeekday = day >= 1 && day <= 5;
+    const isWeekend = !isWeekday;
+
+    // Check weekend patterns first
+    if (isWeekend && patterns.peak?.weekend?.includes(hour)) {
+        return { level: Math.max(2, patterns.peak.level - 1), label: 'moderate' };
+    }
 
     if (isWeekday && patterns.peak?.weekday?.includes(hour)) {
         return { level: patterns.peak.level, label: 'busy' };
@@ -686,6 +715,33 @@ function getConnectionRisk(destination, connectionLine, bufferMins) {
     const destKey = destination.toLowerCase();
     const stats = CONNECTION_STATS[destKey]?.[connectionLine];
     if (!stats) return null;
+
+    // Validate bufferMins
+    if (typeof bufferMins !== 'number' || isNaN(bufferMins)) {
+        return { error: 'Invalid buffer time' };
+    }
+
+    // Handle negative buffer (already missed)
+    if (bufferMins < 0) {
+        return {
+            walkMins: stats.walkMins,
+            bufferMins,
+            isTight: true,
+            successRate: 0,
+            recommendation: 'Connection likely missed - negative buffer'
+        };
+    }
+
+    // Handle zero/very tight buffer
+    if (bufferMins <= stats.walkMins) {
+        return {
+            walkMins: stats.walkMins,
+            bufferMins,
+            isTight: true,
+            successRate: Math.max(0, stats.successRate.tight - 20),
+            recommendation: 'Very tight - need to run'
+        };
+    }
 
     const isTight = bufferMins <= stats.walkMins + 2;
     return {
@@ -935,8 +991,10 @@ app.get('/api/journey/:destination', (req, res) => {
 });
 
 // Best Option Now - smart recommendation considering disruptions
+// Query params: ?speed=walk|brisk|run (default: walk)
 app.get('/api/best/:destination', (req, res) => {
     const query = req.params.destination.toLowerCase().replace(/[^a-z0-9 ]/g, '');
+    const speed = ['walk', 'brisk', 'run'].includes(req.query.speed) ? req.query.speed : 'walk';
 
     // Use predefined destinations or search
     let matchingTiplocs = new Set();
@@ -963,7 +1021,9 @@ app.get('/api/best/:destination', (req, res) => {
     // Gather all options with scoring
     const options = [];
     Object.entries(departures).forEach(([crsCode, deps]) => {
-        const walkMins = CONFIG.walkingTimes[crsCode] || 5;
+        // Get travel time based on speed (walk/brisk/run)
+        const travelTimes = CONFIG.travelTimes[crsCode] || { walk: 5, brisk: 4, run: 3 };
+        const travelMins = travelTimes[speed] || travelTimes.walk;
         const stationInfo = CONFIG.stations[crsCode];
         const line = stationInfo?.line;
         const lineState = lineStatus[line] || { status: 'good' };
@@ -981,7 +1041,7 @@ app.get('/api/best/:destination', (req, res) => {
             // Allow trains up to 3 mins past scheduled (platform delays happen)
             if (minsUntilDeparture < -3) return;
 
-            const leaveInMins = minsUntilDeparture - walkMins;
+            const leaveInMins = minsUntilDeparture - travelMins;
 
             // Extract platform
             let platform = '-';
@@ -1018,18 +1078,26 @@ app.get('/api/best/:destination', (req, res) => {
             // Get exit positioning advice
             const exitAdvice = getExitAdvice(matchedName, crsCode);
 
+            // Calculate if catchable at different speeds
+            const canCatchWalking = minsUntilDeparture - travelTimes.walk >= 0;
+            const canCatchBrisk = minsUntilDeparture - travelTimes.brisk >= 0;
+            const canCatchRunning = minsUntilDeparture - travelTimes.run >= 0;
+
             options.push({
                 station: stationInfo?.name || crsCode,
                 stationCode: crsCode,
                 line: line || '-',
                 lineStatus: lineState.status,
                 lineMessage: lineState.message,
-                walkMins,
+                travelMins,
+                travelTimes,
+                speed,
                 scheduledTime,
                 expectedTime: typeof d.dep === 'object' ? d.dep?.at : d.dep,
                 platform,
                 leaveInMins,
                 catchable: leaveInMins >= 0,
+                canCatch: { walk: canCatchWalking, brisk: canCatchBrisk, run: canCatchRunning },
                 delayed: d.delayed || false,
                 lateReason: d.lateReason,
                 crowding,
@@ -1065,23 +1133,30 @@ app.get('/api/best/:destination', (req, res) => {
         ? options.find(o => o !== best && o.catchable && o.crowding?.level < best.crowding.level)
         : null;
 
+    // Find option catchable if running but not walking
+    const runOption = !best?.catchable
+        ? options.find(o => o.canCatch?.run && !o.canCatch?.walk)
+        : null;
+
     // Status message for edge cases
     let status = 'ok';
     if (options.length === 0) {
         status = 'no_trains';
     } else if (catchableOptions.length === 0) {
-        status = 'all_departed';
+        status = runOption ? 'run_to_catch' : 'all_departed';
     }
 
     res.json({
         timestamp: new Date(),
         lastUpdate,
         destination: matchedName,
+        speed,
         status,
         best,
         departureWindow,
         disruption,
         quieterOption,
+        runOption,
         alternatives: options.slice(1, 4) // Next 3 options
     });
 });

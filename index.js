@@ -168,6 +168,20 @@ const CONFIG = {
         'DNMKHL': 'Denmark Hill',
         'PCKHMRY': 'Peckham Rye',
         'PCKMRYE': 'Peckham Rye',
+        // Southeastern via Penge East (feed-observed codes)
+        'KENTHOS': 'Kent House',
+        'KENTHSE': 'Kent House',
+        'GRVPK': 'Grove Park',
+        'GROVEPK': 'Grove Park',
+        'WDULWCH': 'West Dulwich',
+        'SYDENHH': 'Sydenham Hill',
+        'SYDNHMH': 'Sydenham Hill',
+        'HERNEHL': 'Herne Hill',
+        'HERNEH': 'Herne Hill',
+        'BRIX': 'Brixton',
+        'BRIXTON': 'Brixton',
+        'ELMERSE': 'Elmers End',
+        'CLTHRPS': 'Cleethorpes',
         'NUNHEAD': 'Nunhead',
         'CROFTON': 'Crofton Park',
         'ECROYDN': 'East Croydon',
@@ -1324,6 +1338,7 @@ app.get('/api/debug/raw', (req, res) => {
 function formatDepartures(deps, crsCode) {
     if (!deps || !Array.isArray(deps)) return [];
     const walkMins = crsCode ? (CONFIG.walkingTimes[crsCode] || 5) : null;
+    const ownName = crsCode ? (CONFIG.stations[crsCode]?.name || null) : null;
     return deps.map(d => {
         // Extract platform number - Darwin can send it as object or string
         let platform = '-';
@@ -1349,14 +1364,19 @@ function formatDepartures(deps, crsCode) {
             scheduledTime: d.ptd || d.wtd,
             expectedTime: typeof d.dep === 'object' ? d.dep?.at : d.dep,
             platform: platform,
-            mins: d.mins,
+            // Recompute from the scheduled clock time at response time — the stored
+            // d.mins goes stale between Darwin updates (was the "stuck at 59" bug)
+            mins: minsUntilDeparture !== null ? minsUntilDeparture : d.mins,
             walkMins: walkMins,
             leaveInMins: (minsUntilDeparture !== null && walkMins !== null) ? minsUntilDeparture - walkMins : null,
             cancelled: d.cancelled || false,
             delayed: d.delayed || false,
             lateReason: d.lateReason
         };
-    });
+    })
+    // Drop self-referential rows (a train "to" the station whose board this is —
+    // Darwin association artifacts, e.g. "Penge East → Penge East")
+    .filter(d => !ownName || d.destination !== ownName);
 }
 
 // ============================================

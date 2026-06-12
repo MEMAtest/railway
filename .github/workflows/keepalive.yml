@@ -1,0 +1,23 @@
+name: Keep Render warm
+
+# Render's free tier spins the service down after ~15 min idle; a cold start
+# also restarts the Darwin Kafka consumer, which then takes time to repopulate
+# departures. Ping /health every 10 minutes to keep it warm.
+# (GitHub Actions cron is best-effort — runs can be delayed a few minutes.)
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping /health
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 90 https://railway-tlmc.onrender.com/health || echo "000")
+          echo "health: $code"
+          # Non-200 just means it was asleep and is waking — don't fail the run
+          exit 0

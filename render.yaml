@@ -10,3 +10,8 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      # Darwin Kafka credentials — set these in the Render dashboard, never in git.
+      - key: KAFKA_USERNAME
+        sync: false
+      - key: KAFKA_PASSWORD
+        sync: false

@@ -1,10 +1,26 @@
 /**
- * Darwin Train Data Backend
- * Consumes National Rail Darwin Push Port (Kafka) and serves departure data via REST API
+ * Darwin Train Data Backend — nationwide
+ * ---------------------------------------------------------------------------
+ * Consumes the National Rail Darwin Push Port (Kafka) firehose and serves live
+ * departures + platform numbers for ANY Great Britain station via a REST API.
+ *
+ * The Push Port feed already carries every station in the country; this backend
+ * used to discard all but four SE20 stations. It now resolves stations through a
+ * bundled reference (stations-reference.json: TIPLOC <-> CRS <-> name <-> lat/lon,
+ * derived from fasteroute/national-rail-stations, itself built from the Darwin
+ * feeds) instead of hand-typed tables.
+ *
+ * Retention is LAZY so memory stays bounded despite the full-network firehose:
+ * departures are stored only for stations that are "hot" — requested within the
+ * last HOT_TTL_MS, plus the always-hot SEED_CRS (the SE20 home area). A keep-alive
+ * ping to /health keeps the process (and the seed stations) warm on Render's free
+ * tier so boards don't start empty.
  */
 
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 const { Kafka } = require('kafkajs');
 
 const app = express();
@@ -15,281 +31,96 @@ app.use(express.json());
 // CONFIGURATION
 // ============================================
 const CONFIG = {
-    // Darwin Kafka credentials
+    // Darwin Kafka connection. Credentials come from the environment ONLY (never
+    // committed) — set KAFKA_USERNAME / KAFKA_PASSWORD in the Render dashboard.
+    // Broker host and group id are not secrets, so they keep sensible defaults and
+    // stay env-overridable (a throwaway group id lets the service run locally
+    // without rebalancing partitions away from the production consumer).
     kafka: {
-        brokers: ['pkc-z3p1v0.europe-west2.gcp.confluent.cloud:9092'],
+        brokers: (process.env.KAFKA_BROKERS || 'pkc-z3p1v0.europe-west2.gcp.confluent.cloud:9092').split(','),
         sasl: {
             mechanism: 'plain',
-            username: 'DX2TUIY2J7VV7JU4',
-            password: 'cflto5Fc8uXfjuSq3ILrEGARa2IQtFQhp1mqBhrNWWAKCpuiRp0qGFv2imN3OwDg'
+            username: process.env.KAFKA_USERNAME,
+            password: process.env.KAFKA_PASSWORD
         },
         ssl: true,
-        groupId: 'SC-989188c0-5e4a-49fd-98e6-767a0ba6a66c'
+        groupId: process.env.KAFKA_GROUP_ID || 'SC-989188c0-5e4a-49fd-98e6-767a0ba6a66c'
     },
-    topic: 'prod-1010-Darwin-Train-Information-Push-Port-IIII2_0-JSON',
+    topic: 'prod-1010-Darwin-Train-Information-Push-Port-IIII2_0-JSON'
+};
 
-    // Stations to monitor - both TIPLOC and CRS codes
-    // TIPLOC codes are typically 7 chars, derived from station name
-    stations: {
-        // CRS codes
-        'PNW': { name: 'Penge West', line: 'Southern', crs: 'PNW' },
-        'PNE': { name: 'Penge East', line: 'Southeastern', crs: 'PNE' },
-        'BKB': { name: 'Birkbeck', line: 'Tram', crs: 'BKB' },
-        'ANR': { name: 'Anerley', line: 'Overground', crs: 'ANR' },
-        // Actual TIPLOC codes from Darwin data
-        'ANERLEY': { name: 'Anerley', line: 'Overground', crs: 'ANR' },
-        'BKBY': { name: 'Birkbeck', line: 'Tram', crs: 'BKB' },
-        'PNGEW': { name: 'Penge West', line: 'Southern', crs: 'PNW' },
-        'PENGEWT': { name: 'Penge West', line: 'Southern', crs: 'PNW' },
-        'PNGEE': { name: 'Penge East', line: 'Southeastern', crs: 'PNE' },
-        'PENGEET': { name: 'Penge East', line: 'Southeastern', crs: 'PNE' }
-    },
+// SE20 home-area stations, kept live permanently so they're always warm.
+// (Real CRS codes from the reference — the old backend used made-up ANR/BKB.)
+const SEED_CRS = ['PNW', 'PNE', 'ANZ', 'BIK'];
 
-    // Map TIPLOC to CRS for storage
-    // Based on actual Darwin data: ANERLEY, BKBY are the real codes
-    toCRS: {
-        // Actual Darwin TIPLOC codes
-        'ANERLEY': 'ANR',
-        'BKBY': 'BKB',  // Birkbeck actual TIPLOC
-        'PNGEW': 'PNW',
-        'PENGEWT': 'PNW',
-        'PNGEE': 'PNE',
-        'PENGEET': 'PNE',
-        // CRS codes (fallback)
-        'PNW': 'PNW', 'PNE': 'PNE', 'BKB': 'BKB', 'ANR': 'ANR'
-    },
+// A station stays "hot" (its departures retained + populated from the firehose)
+// for this long after its last board request.
+const HOT_TTL_MS = 30 * 60 * 1000;   // 30 minutes
+const MAX_PER_STATION = 12;
 
-    // Station name lookup by TIPLOC
-    stationNames: {
-        'ANERLEY': 'Anerley',
-        'BKBY': 'Birkbeck',
-        'PNGEW': 'Penge West',
-        'PENGEWT': 'Penge West',
-        'PNGEE': 'Penge East',
-        'PENGEET': 'Penge East',
-        // Victoria variations
-        'VICTRIC': 'Victoria',
-        'VICTRIA': 'Victoria',
-        'VICTRIE': 'Victoria',
-        'VICTRI': 'Victoria',
-        // London Bridge variations
-        'LNDNBDE': 'London Bridge',
-        'LNDNBDG': 'London Bridge',
-        'LONBDGE': 'London Bridge',
-        'LONDONB': 'London Bridge',
-        // Charing Cross
-        'CHRX': 'Charing Cross',
-        'CHARING': 'Charing Cross',
-        'CHARX': 'Charing Cross',
-        // Cannon Street
-        'CANNON': 'Cannon Street',
-        'CANNS': 'Cannon Street',
-        'CANONST': 'Cannon Street',
-        // Orpington
-        'ORPNGTN': 'Orpington',
-        'ORPINTN': 'Orpington',
-        'ORPINGT': 'Orpington',
-        // Beckenham
-        'BCKJN': 'Beckenham Jct',
-        'BNKCHSX': 'Beckenham Jct',
-        'BCKHMJN': 'Beckenham Jct',
-        'BCKNHMJ': 'Beckenham Jct',
-        'BECKHM': 'Beckenham Jct',
-        // Wimbledon
-        'WIMBLDN': 'Wimbledon',
-        'WMBLEDN': 'Wimbledon',
-        'WIMBLED': 'Wimbledon',
-        // Crystal Palace
-        'CRYSTLP': 'Crystal Palace',
-        'CRYSTPL': 'Crystal Palace',
-        'CRSTLPL': 'Crystal Palace',
-        // West Croydon
-        'WCROYDN': 'West Croydon',
-        'WSTCROY': 'West Croydon',
-        'WCRDON': 'West Croydon',
-        // Other stations
-        'HGHBYIS': 'Highbury & Islington',
-        'HIGHBRY': 'Highbury & Islington',
-        'CATFORD': 'Catford',
-        'CTFD': 'Catford',
-        'HAYES': 'Hayes',
-        'HAYESRL': 'Hayes',
-        'BROMLEY': 'Bromley South',
-        'BRMLEYS': 'Bromley South',
-        'BICKLEY': 'Bickley',
-        'BICKLYJ': 'Bickley',
-        'STNBS': 'St Johns',
-        'STJOHNS': 'St Johns',
-        'ELTHAM': 'Eltham',
-        'ELTNHMR': 'Eltham',
-        'GRWICH': 'Greenwich',
-        'GREENW': 'Greenwich',
-        'BLKHTH': 'Blackheath',
-        'BLCKHTH': 'Blackheath',
-        'LEWISHM': 'Lewisham',
-        'LEWISHJ': 'Lewisham',
-        'LADWELL': 'Ladywell',
-        'CTFDBGE': 'Catford Bridge',
-        'CATFDBR': 'Catford Bridge',
-        'BELNGHM': 'Bellingham',
-        'RAVPRKS': 'Ravensbourne',
-        'SHORTLD': 'Shortlands',
-        'BRMLYNS': 'Bromley North',
-        'SNDRSTD': 'Sanderstead',
-        'NRWD JN': 'Norwood Jct',
-        'NRWDJN': 'Norwood Jct',
-        'SYDENHM': 'Sydenham',
-        'SYDENH': 'Sydenham',
-        'FORHILL': 'Forest Hill',
-        'FRSTHL': 'Forest Hill',
-        'HONROPK': 'Honor Oak Park',
-        'BROCKY': 'Brockley',
-        'NEWXGTE': 'New Cross Gate',
-        'NEWX': 'New Cross',
-        'SURREYQ': 'Surrey Quays',
-        'DENMARKH': 'Denmark Hill',
-        'PCKHMRY': 'Peckham Rye',
-        'NUNHEAD': 'Nunhead',
-        'CROFTON': 'Crofton Park',
-        'ECROYDN': 'East Croydon',
-        'EASTCRY': 'East Croydon',
-        // Overground destinations
-        'HGHI': 'Highbury & Islington',
-        'HIGHBIS': 'Highbury & Islington',
-        'HIGHBYI': 'Highbury & Islington',
-        'WCROYDO': 'West Croydon',
-        'WESTCRO': 'West Croydon',
-        'WSTCRDN': 'West Croydon',
-        // More London terminals
-        'EUSTON': 'Euston',
-        'EUSTNMS': 'Euston',
-        'STPX': 'St Pancras',
-        'STPANCI': 'St Pancras',
-        'STPANCR': 'St Pancras',
-        'KNGX': 'Kings Cross',
-        'KGXMSLS': 'Kings Cross',
-        'KNGSCRS': 'Kings Cross',
-        'LIVST': 'Liverpool Street',
-        'LIVSTLL': 'Liverpool Street',
-        'LVRPLST': 'Liverpool Street',
-        'WATRLMN': 'Waterloo',
-        'WATERLM': 'Waterloo',
-        'WATERLE': 'Waterloo',
-        'PADTON': 'Paddington',
-        'PADTONL': 'Paddington',
-        'PADDNTN': 'Paddington',
-        'FENCHST': 'Fenchurch Street',
-        'FENCHRC': 'Fenchurch Street',
-        'MRGT': 'Moorgate',
-        'MOORGAT': 'Moorgate',
-        // South London
-        'CLPHMJN': 'Clapham Junction',
-        'CLPHMJC': 'Clapham Junction',
-        'CLAPHMJ': 'Clapham Junction',
-        'BATRSEA': 'Battersea Park',
-        'BATSPK': 'Battersea Park',
-        'PCKHMQS': 'Peckham Queens Road',
-        'QNSRDPK': 'Queens Road Peckham',
-        'BERMSEY': 'Bermondsey',
-        'CWATERJ': 'Canada Water',
-        'CANWATE': 'Canada Water',
-        'SURQYS': 'Surrey Quays',
-        'SUREYQY': 'Surrey Quays',
-        'ROTHRTH': 'Rotherhithe',
-        'WAPING': 'Wapping',
-        'WAPPING': 'Wapping',
-        'SHADWEL': 'Shadwell',
-        'WHTCHPL': 'Whitechapel',
-        'WHTECHP': 'Whitechapel',
-        'SHOREDH': 'Shoreditch High Street',
-        'SHRDHST': 'Shoreditch High Street',
-        'HOXTN': 'Hoxton',
-        'HOXTON': 'Hoxton',
-        'HGGRSTN': 'Haggerston',
-        'DALSTNK': 'Dalston Kingsland',
-        'DALSKNG': 'Dalston Kingsland',
-        'DALSTJN': 'Dalston Junction',
-        'DALSJN': 'Dalston Junction',
-        'CNNONBY': 'Canonbury',
-        'CANONBY': 'Canonbury',
-        // Croydon area
-        'NRWDJCT': 'Norwood Junction',
-        'CRDONCS': 'Croydon Central',
-        'STHCROY': 'South Croydon',
-        'PURLEY': 'Purley',
-        'PURLEYO': 'Purley Oaks',
-        'SANDRST': 'Sanderstead',
-        'RIDDLSD': 'Riddlesdown',
-        'UPPERWA': 'Upper Warlingham',
-        'WARLNGH': 'Warlingham',
-        'WHYTELF': 'Whyteleafe',
-        'CATHAMS': 'Caterham',
-        // Tram destinations
-        'ELMERSD': 'Elmers End',
-        'ELMERSE': 'Elmers End',
-        'BECKROD': 'Beckenham Road',
-        'BCKROAD': 'Beckenham Road',
-        'AVENUE': 'Avenue Road',
-        'AVENURD': 'Avenue Road',
-        'WOODSID': 'Woodside',
-        'BLKHRSE': 'Blackhorse Lane',
-        'ADDSCMB': 'Addiscombe',
-        'ADDISCO': 'Addiscombe',
-        'LLOYD': 'Lloyd Park',
-        'LLYDPRK': 'Lloyd Park',
-        'COOMBE': 'Coombe Lane',
-        'GRNGWOD': 'Gravel Hill',
-        'ADNGTNV': 'Addington Village',
-        'KING HY': 'King Henrys Drive',
-        'NEWADNG': 'New Addington',
-        // Additional from debug
-        'THBDGS': 'Theobalds Grove',
-        'GRVRBGJ': 'Grove Park',
-        'GROVEPK': 'Grove Park',
-        'GRVPKJN': 'Grove Park',
-        'GRAVSND': 'Gravesend',
-        'GRVSEND': 'Gravesend',
-        'DARTFRD': 'Dartford',
-        'DARTFD': 'Dartford',
-        'GILLGM': 'Gillingham',
-        'GILNGHM': 'Gillingham',
-        'RAINHM': 'Rainham',
-        'SLADE': 'Slade Green',
-        'SLDEGRN': 'Slade Green',
-        'ELTHAMW': 'Eltham Well Hall',
-        'KIDBRKE': 'Kidbrooke',
-        'CHARLTN': 'Charlton',
-        'WOLWCHA': 'Woolwich Arsenal',
-        'WOLWCHD': 'Woolwich Dockyard',
-        'ABYWOOD': 'Abbey Wood',
-        'ABBEYW': 'Abbey Wood',
-        'BELVDER': 'Belvedere',
-        'ERITH': 'Erith',
-        'BARNHRS': 'Barnehurst',
-        'BEXLEYH': 'Bexleyheath',
-        'WELLING': 'Welling',
-        'FALCONW': 'Falconwood'
+// ============================================
+// STATION REFERENCE (TIPLOC <-> CRS <-> name <-> lat/lon)
+// ============================================
+const refByTiploc = new Map();   // TIPLOC -> {tiploc, crs, name, lat, lon}
+const refByCrs = new Map();      // CRS    -> {tiploc, crs, name, lat, lon}
+const refCoords = [];            // records with valid coords, for nearest lookup
+
+function loadReference() {
+    try {
+        const raw = fs.readFileSync(path.join(__dirname, 'stations-reference.json'), 'utf8');
+        const arr = JSON.parse(raw);
+        arr.forEach(e => {
+            if (!e.tiploc || !e.crs) return;
+            const rec = { tiploc: e.tiploc, crs: e.crs, name: e.name || e.crs, lat: +e.lat || 0, lon: +e.lon || 0 };
+            refByTiploc.set(e.tiploc, rec);
+            // First TIPLOC seen for a CRS becomes the canonical record for that CRS
+            if (!refByCrs.has(e.crs)) refByCrs.set(e.crs, rec);
+            // Nearest-match pool excludes London Underground / junction pseudo-stations
+            // (CRS starting Z or X) which carry no National Rail departures and could
+            // otherwise shadow a co-located real station.
+            if (rec.lat && rec.lon && !/^[ZX]/.test(rec.crs)) refCoords.push(rec);
+        });
+        console.log(`Loaded station reference: ${refByTiploc.size} TIPLOCs, ${refByCrs.size} CRS, ${refCoords.length} with coords`);
+    } catch (e) {
+        console.error('Failed to load stations-reference.json:', e.message);
     }
-};
+}
+loadReference();
+
+function tiplocToCrs(tiploc) { const r = refByTiploc.get(tiploc); return r ? r.crs : null; }
+function nameForTiploc(tiploc) { const r = refByTiploc.get(tiploc); return r ? r.name : null; }
+
+function haversineKm(a1, o1, a2, o2) {
+    const R = 6371, toR = Math.PI / 180;
+    const dLat = (a2 - a1) * toR, dLon = (o2 - o1) * toR;
+    const s = Math.sin(dLat / 2) ** 2 + Math.cos(a1 * toR) * Math.cos(a2 * toR) * Math.sin(dLon / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+// Nearest station CRS to a lat/lon within maxKm
+function nearestCrs(lat, lon, maxKm = 1.2) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    let best = null, bestD = Infinity;
+    for (const r of refCoords) {
+        const d = haversineKm(lat, lon, r.lat, r.lon);
+        if (d < bestD) { bestD = d; best = r; }
+    }
+    return best && bestD <= maxKm ? best.crs : null;
+}
 
 // ============================================
-// IN-MEMORY STORE FOR DEPARTURES
+// IN-MEMORY STORE (lazy, per-CRS)
 // ============================================
-const departures = {
-    PNW: [],
-    PNE: [],
-    BKB: [],
-    ANR: []
-};
+const departures = {};           // CRS -> [ departure, ... ]
+const hot = new Map();           // CRS -> last-requested ms (Infinity = seed, never expires)
+SEED_CRS.forEach(c => hot.set(c, Infinity));
 
-// Store service messages (delays, cancellations)
-const serviceMessages = [];
+function isHot(crs) {
+    const t = hot.get(crs);
+    return t !== undefined && (t === Infinity || (Date.now() - t) < HOT_TTL_MS);
+}
+function markHot(crs) { if (!SEED_CRS.includes(crs)) hot.set(crs, Date.now()); }
 
-// Debug: store recent station codes seen
-const recentStations = new Set();
-const sampleMessages = [];
-
-// Last update timestamp
 let lastUpdate = null;
 let kafkaConnected = false;
 let messageCount = 0;
@@ -313,442 +144,172 @@ const kafka = new Kafka({
 const consumer = kafka.consumer({ groupId: CONFIG.kafka.groupId });
 
 /**
- * Process incoming Darwin messages
- * Darwin Push Port messages have train data inside a 'bytes' field as JSON string
+ * Process incoming Darwin messages. Push Port messages wrap the payload as a JSON
+ * string inside a 'bytes' field.
  */
 function processDarwinMessage(message) {
     try {
         const wrapper = JSON.parse(message.value.toString());
         messageCount++;
-
-        // The actual data is inside the 'bytes' field as a JSON string
         if (!wrapper.bytes) return;
-
         const data = JSON.parse(wrapper.bytes);
 
-        // Store sample messages for debugging (keep last 5)
-        if (sampleMessages.length < 5) {
-            sampleMessages.push({
-                keys: Object.keys(data),
-                hasUR: !!data.uR,
-                hasTS: data.uR ? !!data.uR.TS : false,
-                sample: JSON.stringify(data).substring(0, 800)
-            });
-        }
-
-        // Process uR (update) messages
         if (data.uR) {
-            // Handle Train Status updates
             if (data.uR.TS) {
-                const tsArray = Array.isArray(data.uR.TS) ? data.uR.TS : [data.uR.TS];
-                tsArray.forEach(ts => processTrainStatus(ts));
+                const arr = Array.isArray(data.uR.TS) ? data.uR.TS : [data.uR.TS];
+                arr.forEach(ts => processTrainStatus(ts));
             }
-
-            // Handle schedule updates
             if (data.uR.schedule) {
-                const schedArray = Array.isArray(data.uR.schedule) ? data.uR.schedule : [data.uR.schedule];
-                schedArray.forEach(s => processSchedule(s));
-            }
-
-            // Handle station messages (OW)
-            if (data.uR.OW) {
-                const owArray = Array.isArray(data.uR.OW) ? data.uR.OW : [data.uR.OW];
-                owArray.forEach(ow => processStationMessage(ow));
+                const arr = Array.isArray(data.uR.schedule) ? data.uR.schedule : [data.uR.schedule];
+                arr.forEach(s => processSchedule(s));
             }
         }
-
         lastUpdate = new Date();
     } catch (error) {
-        // Silently ignore parse errors
+        // Silently ignore parse errors (firehose has occasional malformed frames)
     }
 }
 
 /**
- * Process Train Status (TS) messages
- * Contains real-time running information
+ * Train Status (TS) — real-time running info (delays, platforms, cancellations).
  */
 function processTrainStatus(ts) {
-    if (!ts.LateReason && !ts.Location) return;
-
-    // Extract locations this train is calling at
+    if (!ts.Location) return;
     const locations = Array.isArray(ts.Location) ? ts.Location : [ts.Location];
-
-    // Find the final destination (last location in the array)
-    const validLocations = locations.filter(l => l && l.tpl);
-    const finalDestination = validLocations.length > 0 ? validLocations[validLocations.length - 1].tpl : null;
+    const valid = locations.filter(l => l && l.tpl);
+    const finalDest = valid.length ? valid[valid.length - 1].tpl : null;
 
     locations.forEach(loc => {
-        if (!loc) return;
-
-        const stationCode = loc.tpl; // TIPLOC code
-
-        // Track all stations for debugging
-        if (stationCode) {
-            recentStations.add(stationCode);
-        }
-
-        // Check if this is one of our monitored stations (by TIPLOC or CRS)
-        const crsCode = CONFIG.toCRS[stationCode];
-        if (crsCode) {
-            updateDeparture(stationCode, {
-                rid: ts.rid, // Unique train ID
-                uid: ts.uid,
-                ssd: ts.ssd, // Scheduled start date
-                tpl: stationCode,
-                pta: loc.pta, // Public time of arrival
-                ptd: loc.ptd, // Public time of departure
-                wta: loc.wta, // Working time of arrival
-                wtd: loc.wtd, // Working time of departure
-                arr: loc.arr, // Actual/estimated arrival
-                dep: loc.dep, // Actual/estimated departure
-                plat: loc.plat, // Platform
-                cancelled: loc.can === 'true',
-                delayed: ts.LateReason ? true : false,
-                lateReason: ts.LateReason,
-                destination: finalDestination // Add final destination from TS message
-            });
-        }
+        if (!loc || !loc.tpl) return;
+        const crs = tiplocToCrs(loc.tpl);
+        if (!crs || !isHot(crs)) return;   // only store stations someone is watching
+        updateDeparture(crs, {
+            rid: ts.rid, uid: ts.uid, ssd: ts.ssd, tpl: loc.tpl,
+            pta: loc.pta, ptd: loc.ptd, wta: loc.wta, wtd: loc.wtd,
+            arr: loc.arr, dep: loc.dep, plat: loc.plat,
+            cancelled: loc.can === 'true',
+            delayed: !!ts.LateReason, lateReason: ts.LateReason,
+            destination: finalDest
+        });
     });
 }
 
 /**
- * Process Schedule messages
- * Contains timetable information for trains
+ * Schedule — timetable info: which trains call at which stations and when.
  */
 function processSchedule(schedule) {
     if (!schedule.OR && !schedule.IP && !schedule.DT) return;
-
-    // Get all calling points
-    const callingPoints = [
+    const points = [
         ...(schedule.OR ? [schedule.OR] : []),
         ...(schedule.IP ? (Array.isArray(schedule.IP) ? schedule.IP : [schedule.IP]) : []),
         ...(schedule.DT ? [schedule.DT] : [])
     ];
+    const destTpl = (schedule.DT && schedule.DT.tpl) || null;
 
-    callingPoints.forEach(point => {
-        if (!point || !point.tpl) return;
-
-        const stationCode = point.tpl;
-
-        // Track all stations for debugging
-        if (stationCode) {
-            recentStations.add(stationCode);
-        }
-
-        // Check if this is one of our monitored stations
-        const crsCode = CONFIG.toCRS[stationCode];
-        if (crsCode) {
-            updateDeparture(stationCode, {
-                rid: schedule.rid,
-                uid: schedule.uid,
-                ssd: schedule.ssd,
-                tpl: stationCode,
-                trainId: schedule.trainId,
-                toc: schedule.toc, // Train operating company
-                pta: point.pta,
-                ptd: point.ptd,
-                wta: point.wta,
-                wtd: point.wtd,
-                plat: point.plat,
-                activity: point.act,
-                destination: getDestination(schedule)
-            });
-        }
-    });
-}
-
-/**
- * Get final destination from schedule
- */
-function getDestination(schedule) {
-    if (schedule.DT && schedule.DT.tpl) {
-        return schedule.DT.tpl;
-    }
-    return null;
-}
-
-/**
- * Process station messages (alerts, announcements)
- */
-function processStationMessage(ow) {
-    if (!ow.Station) return;
-
-    const stations = Array.isArray(ow.Station) ? ow.Station : [ow.Station];
-
-    stations.forEach(station => {
-        if (CONFIG.stations[station.crs]) {
-            serviceMessages.push({
-                station: station.crs,
-                message: ow.Msg,
-                severity: ow.Severity,
-                timestamp: new Date()
-            });
-
-            // Keep only last 20 messages
-            if (serviceMessages.length > 20) {
-                serviceMessages.shift();
-            }
-        }
-    });
-}
-
-/**
- * Update departure information for a station
- */
-function updateDeparture(stationCode, trainData) {
-    // Convert TIPLOC to CRS for storage
-    const crsCode = CONFIG.toCRS[stationCode] || stationCode;
-    const stationDepartures = departures[crsCode];
-    if (!stationDepartures) return;
-
-    // Add station info
-    trainData.stationCode = crsCode;
-    trainData.stationName = CONFIG.stations[stationCode]?.name || crsCode;
-
-    // Find existing entry for this train
-    const existingIndex = stationDepartures.findIndex(d => d.rid === trainData.rid);
-
-    // Calculate minutes until departure
-    const departureTime = trainData.ptd || trainData.wtd || trainData.dep;
-    if (departureTime) {
-        trainData.mins = calculateMinutes(departureTime);
-    }
-
-    if (existingIndex >= 0) {
-        // Update existing
-        stationDepartures[existingIndex] = {
-            ...stationDepartures[existingIndex],
-            ...trainData,
-            updatedAt: new Date()
-        };
-    } else {
-        // Add new
-        stationDepartures.push({
-            ...trainData,
-            createdAt: new Date(),
-            updatedAt: new Date()
+    points.forEach(p => {
+        if (!p || !p.tpl) return;
+        const crs = tiplocToCrs(p.tpl);
+        if (!crs || !isHot(crs)) return;
+        updateDeparture(crs, {
+            rid: schedule.rid, uid: schedule.uid, ssd: schedule.ssd, tpl: p.tpl,
+            toc: schedule.toc, pta: p.pta, ptd: p.ptd, wta: p.wta, wtd: p.wtd,
+            plat: p.plat, activity: p.act, destination: destTpl
         });
-    }
-
-    // Sort by departure time and keep only next 10
-    stationDepartures.sort((a, b) => {
-        const timeA = a.ptd || a.wtd || '99:99';
-        const timeB = b.ptd || b.wtd || '99:99';
-        return timeA.localeCompare(timeB);
     });
-
-    // Remove past departures and keep only next 10
-    const now = new Date();
-    departures[stationCode] = stationDepartures
-        .filter(d => {
-            if (d.mins !== undefined && d.mins < -2) return false; // Already departed
-            return true;
-        })
-        .slice(0, 10);
 }
 
 /**
- * Calculate minutes from now until given time (HH:MM format)
+ * Insert/update one departure for a station, keeping the soonest MAX_PER_STATION.
+ */
+function updateDeparture(crs, trainData) {
+    const list = departures[crs] || (departures[crs] = []);
+    trainData.stationCode = crs;
+
+    const timeStr = trainData.ptd || trainData.wtd;
+    if (timeStr) trainData.mins = calculateMinutes(timeStr);
+
+    const i = list.findIndex(d => d.rid === trainData.rid);
+    if (i >= 0) list[i] = { ...list[i], ...trainData, updatedAt: Date.now() };
+    else list.push({ ...trainData, createdAt: Date.now(), updatedAt: Date.now() });
+
+    list.sort((a, b) => String(a.ptd || a.wtd || '99:99').localeCompare(String(b.ptd || b.wtd || '99:99')));
+    departures[crs] = list
+        .filter(d => d.mins === undefined || d.mins >= -2)
+        .slice(0, MAX_PER_STATION);
+}
+
+/**
+ * Minutes from now until an "HH:MM" time (24h). Returns undefined for non-times.
  */
 function calculateMinutes(timeStr) {
-    if (!timeStr) return null;
-
+    if (!timeStr || typeof timeStr !== 'string' || !timeStr.includes(':')) return undefined;
     const [hours, mins] = timeStr.split(':').map(Number);
+    if (!Number.isFinite(hours) || !Number.isFinite(mins)) return undefined;
     const now = new Date();
     const target = new Date();
     target.setHours(hours, mins, 0, 0);
-
-    // Handle times past midnight
-    if (target < now && hours < 6) {
-        target.setDate(target.getDate() + 1);
-    }
-
+    // Times just after midnight belong to tomorrow
+    if (target < now && hours < 6) target.setDate(target.getDate() + 1);
     return Math.round((target - now) / 60000);
 }
 
 /**
- * Start Kafka consumer
+ * Periodic cleanup: recompute minutes, drop departed trains, evict cold stations.
  */
+setInterval(() => {
+    Object.keys(departures).forEach(crs => {
+        if (!isHot(crs)) { delete departures[crs]; hot.delete(crs); return; }
+        departures[crs].forEach(d => { const t = d.ptd || d.wtd; if (t) d.mins = calculateMinutes(t); });
+        departures[crs] = departures[crs]
+            .filter(d => d.mins === undefined || d.mins >= -2)
+            .slice(0, MAX_PER_STATION);
+        if (departures[crs].length === 0) delete departures[crs];
+    });
+    // Drop expired hot markers (non-seed) with no stored data
+    hot.forEach((t, crs) => { if (t !== Infinity && (Date.now() - t) >= HOT_TTL_MS && !departures[crs]) hot.delete(crs); });
+}, 60 * 1000);
+
 async function startKafkaConsumer() {
+    if (!CONFIG.kafka.sasl.username || !CONFIG.kafka.sasl.password) {
+        console.error('KAFKA_USERNAME / KAFKA_PASSWORD not set — Darwin feed disabled. ' +
+            'Set them in the Render environment for this service.');
+        return;
+    }
     try {
         console.log('Connecting to Darwin Kafka...');
         await consumer.connect();
-        console.log('Connected! Subscribing to topic...');
-
-        await consumer.subscribe({
-            topic: CONFIG.topic,
-            fromBeginning: false
-        });
-
-        console.log('Subscribed! Starting consumer...');
-
+        await consumer.subscribe({ topic: CONFIG.topic, fromBeginning: false });
         await consumer.run({
-            eachMessage: async ({ topic, partition, message }) => {
-                processDarwinMessage(message);
-            }
+            eachMessage: async ({ message }) => { processDarwinMessage(message); }
         });
-
         kafkaConnected = true;
         console.log('Darwin Kafka consumer running!');
-
     } catch (error) {
         console.error('Failed to start Kafka consumer:', error.message);
         kafkaConnected = false;
-
-        // Retry after 30 seconds
-        setTimeout(startKafkaConsumer, 30000);
+        setTimeout(startKafkaConsumer, 30000);   // retry
     }
 }
 
 // ============================================
-// REST API ENDPOINTS
+// FORMATTING
 // ============================================
-
-// Health check
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'ok',
-        kafkaConnected,
-        lastUpdate,
-        messageCount,
-        stationsMonitored: Object.keys(CONFIG.stations)
-    });
-});
-
-// Get all departures for all stations
-app.get('/api/departures', (req, res) => {
-    const response = {};
-
-    Object.keys(departures).forEach(station => {
-        response[station] = {
-            name: CONFIG.stations[station].name,
-            line: CONFIG.stations[station].line,
-            departures: formatDepartures(departures[station])
-        };
-    });
-
-    res.json({
-        timestamp: new Date(),
-        lastUpdate,
-        stations: response
-    });
-});
-
-// Get departures for a specific station
-app.get('/api/departures/:station', (req, res) => {
-    const station = req.params.station.toUpperCase();
-
-    if (!CONFIG.stations[station]) {
-        return res.status(404).json({ error: 'Station not found' });
-    }
-
-    res.json({
-        timestamp: new Date(),
-        lastUpdate,
-        station: {
-            code: station,
-            name: CONFIG.stations[station].name,
-            line: CONFIG.stations[station].line,
-            departures: formatDepartures(departures[station])
-        }
-    });
-});
-
-// Get service messages/alerts
-app.get('/api/messages', (req, res) => {
-    res.json({
-        timestamp: new Date(),
-        messages: serviceMessages
-    });
-});
-
-// Get status (for debugging)
-app.get('/api/status', (req, res) => {
-    res.json({
-        kafkaConnected,
-        lastUpdate,
-        messageCount,
-        departuresCount: {
-            PNW: departures.PNW.length,
-            PNE: departures.PNE.length,
-            BKB: departures.BKB.length,
-            ANR: departures.ANR.length
-        }
-    });
-});
-
-// Debug endpoint - see sample messages
-app.get('/api/debug/samples', (req, res) => {
-    res.json({
-        messageCount,
-        sampleMessages
-    });
-});
-
-// Debug endpoint - see what stations are coming through
-app.get('/api/debug/stations', (req, res) => {
-    // Filter for stations that might be Penge-related
-    const allStations = Array.from(recentStations).sort();
-    const pengeRelated = allStations.filter(s =>
-        s.toLowerCase().includes('png') ||
-        s.toLowerCase().includes('peng') ||
-        s.toLowerCase().includes('aner') ||
-        s.toLowerCase().includes('birk') ||
-        s.toLowerCase().includes('anr') ||
-        s.toLowerCase().includes('pnw') ||
-        s.toLowerCase().includes('pne') ||
-        s.toLowerCase().includes('bkb')
-    );
-
-    res.json({
-        totalStationsSeen: allStations.length,
-        pengeRelated,
-        allStations: allStations.slice(0, 200), // First 200 stations
-        monitoredCodes: Object.keys(CONFIG.toCRS)
-    });
-});
-
-// Debug endpoint - see raw departures with TIPLOCs
-app.get('/api/debug/raw', (req, res) => {
-    const rawData = {};
-    Object.keys(departures).forEach(station => {
-        rawData[station] = departures[station].map(d => ({
-            destination: d.destination,
-            resolvedName: CONFIG.stationNames[d.destination] || 'Unknown',
-            scheduledTime: d.ptd || d.wtd,
-            platform: d.plat
-        }));
-    });
-    res.json({
-        rawData,
-        knownMappings: Object.keys(CONFIG.stationNames).length
-    });
-});
-
-/**
- * Format departures for API response
- */
 function formatDepartures(deps) {
-    return deps.map(d => {
-        // Extract platform number - Darwin can send it as object or string
+    return (deps || []).map(d => {
+        // Platform: Darwin sends a string, or an object like {platsrc,conf,"":"2"}
         let platform = '-';
         if (d.plat) {
-            if (typeof d.plat === 'string') {
-                platform = d.plat;
-            } else if (typeof d.plat === 'object') {
-                // Darwin sends platform as object like {platsrc: "A", conf: "true", "": "2"}
-                platform = d.plat[''] || d.plat.plat || Object.values(d.plat).find(v => /^[0-9]+$/.test(v)) || '-';
+            if (typeof d.plat === 'string') platform = d.plat;
+            else if (typeof d.plat === 'object') {
+                platform = d.plat[''] || d.plat.plat
+                    || Object.values(d.plat).find(v => /^[0-9]+[A-Za-z]?$/.test(String(v))) || '-';
             }
         }
-
-        // Format destination from TIPLOC
-        const destName = CONFIG.stationNames[d.destination] || d.destination || 'Unknown';
-
         return {
-            destination: destName,
-            scheduledTime: d.ptd || d.wtd,
-            expectedTime: typeof d.dep === 'object' ? d.dep?.at : d.dep,
-            platform: platform,
+            destination: nameForTiploc(d.destination) || d.destination || 'Unknown',
+            scheduledTime: d.ptd || d.wtd || '',
+            expectedTime: typeof d.dep === 'object' ? (d.dep && (d.dep.at || d.dep['@t'])) : d.dep,
+            platform,
             mins: d.mins,
             cancelled: d.cancelled || false,
             delayed: d.delayed || false,
@@ -758,22 +319,80 @@ function formatDepartures(deps) {
 }
 
 // ============================================
-// START SERVER
+// REST API
 // ============================================
-const PORT = process.env.PORT || 10000; // Render uses port 10000 by default
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'ok', kafkaConnected, lastUpdate, messageCount,
+        referenceLoaded: refByCrs.size, hotStations: hot.size, trackedStations: Object.keys(departures).length
+    });
+});
 
+// Live board for ANY station — by ?crs=XXX or by ?lat=..&lon=.. (nearest station).
+app.get('/api/board', (req, res) => {
+    let crs = (req.query.crs || '').toString().trim().toUpperCase();
+    if (!crs && req.query.lat != null && req.query.lon != null) {
+        crs = nearestCrs(parseFloat(req.query.lat), parseFloat(req.query.lon)) || '';
+    }
+    if (!crs || !refByCrs.has(crs)) {
+        return res.status(404).json({ error: 'Station not found', crs: crs || null });
+    }
+    markHot(crs);
+    const rec = refByCrs.get(crs);
+    const board = departures[crs] || [];
+    res.json({
+        timestamp: new Date(),
+        lastUpdate,
+        station: { crs, name: rec.name, lat: rec.lat, lon: rec.lon },
+        warming: board.length === 0,   // just went hot — will fill from the feed shortly
+        departures: formatDepartures(board)
+    });
+});
+
+// Back-compat: the SE20 home-area board in the old shape.
+app.get('/api/departures', (req, res) => {
+    const stations = {};
+    SEED_CRS.forEach(crs => {
+        const rec = refByCrs.get(crs) || { name: crs };
+        stations[crs] = { name: rec.name, line: '', departures: formatDepartures(departures[crs] || []) };
+    });
+    res.json({ timestamp: new Date(), lastUpdate, stations });
+});
+
+// Back-compat: single station by CRS (old path).
+app.get('/api/departures/:station', (req, res) => {
+    const crs = req.params.station.toUpperCase();
+    if (!refByCrs.has(crs)) return res.status(404).json({ error: 'Station not found' });
+    markHot(crs);
+    const rec = refByCrs.get(crs);
+    res.json({
+        timestamp: new Date(), lastUpdate,
+        station: { code: crs, name: rec.name, departures: formatDepartures(departures[crs] || []) }
+    });
+});
+
+app.get('/api/status', (req, res) => {
+    res.json({
+        kafkaConnected, lastUpdate, messageCount,
+        referenceLoaded: refByCrs.size,
+        hotStations: Array.from(hot.keys()),
+        tracked: Object.fromEntries(Object.keys(departures).map(c => [c, departures[c].length]))
+    });
+});
+
+// ============================================
+// START
+// ============================================
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
     console.log(`Darwin API server running on port ${PORT}`);
-    console.log(`Monitoring stations: ${Object.keys(CONFIG.stations).join(', ')}`);
-
-    // Start Kafka consumer
+    console.log(`Seed (always-hot) stations: ${SEED_CRS.join(', ')}`);
     startKafkaConsumer();
 });
 
-// Graceful shutdown
 process.on('SIGTERM', async () => {
     console.log('Shutting down...');
-    await consumer.disconnect();
+    try { await consumer.disconnect(); } catch (e) { /* ignore */ }
     process.exit(0);
 });
 

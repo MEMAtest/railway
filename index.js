@@ -4,17 +4,9 @@
  * Consumes the National Rail Darwin Push Port (Kafka) firehose and serves live
  * departures + platform numbers for ANY Great Britain station via a REST API.
  *
- * The Push Port feed already carries every station in the country; this backend
- * used to discard all but four SE20 stations. It now resolves stations through a
- * bundled reference (stations-reference.json: TIPLOC <-> CRS <-> name <-> lat/lon,
- * derived from fasteroute/national-rail-stations, itself built from the Darwin
- * feeds) instead of hand-typed tables.
- *
- * Retention is LAZY so memory stays bounded despite the full-network firehose:
- * departures are stored only for stations that are "hot" — requested within the
- * last HOT_TTL_MS, plus the always-hot SEED_CRS (the SE20 home area). A keep-alive
- * ping to /health keeps the process (and the seed stations) warm on Render's free
- * tier so boards don't start empty.
+ * Retention is LAZY: departures stored only for "hot" stations (requested in
+ * the last HOT_TTL_MS) plus always-hot SEED_CRS (SE20 home area). A Hetzner
+ * cron pings /health every 10 min so Render never sleeps.
  */
 
 const express = require('express');
@@ -31,8 +23,6 @@ app.use(express.json());
 // CONFIGURATION
 // ============================================
 const CONFIG = {
-    // Darwin Kafka connection. Credentials come from the environment ONLY (never
-    // committed) — set KAFKA_USERNAME / KAFKA_PASSWORD in the Render dashboard.
     kafka: {
         brokers: (process.env.KAFKA_BROKERS || 'pkc-z3p1v0.europe-west2.gcp.confluent.cloud:9092').split(','),
         sasl: {
@@ -46,14 +36,13 @@ const CONFIG = {
     topic: 'prod-1010-Darwin-Train-Information-Push-Port-IIII2_0-JSON'
 };
 
-// SE20 home-area stations, kept live permanently so they're always warm.
 const SEED_CRS = ['PNW', 'PNE', 'ANZ', 'BIK'];
+const SEED_CRS_SET = new Set(SEED_CRS);   // O(1) membership test
 
-// A station stays "hot" for this long after its last board request.
-const HOT_TTL_MS = 30 * 60 * 1000;   // 30 minutes
+const HOT_TTL_MS = 30 * 60 * 1000;
 const MAX_PER_STATION = 12;
 
-// SE20 journey planning data — travel times, line info, common destinations
+// SE20 journey planning data
 const SE20_LINES = {
     'PNW': 'Southern', 'PNE': 'Southeastern', 'ANZ': 'Overground', 'BIK': 'Tram'
 };
@@ -65,8 +54,6 @@ const SE20_TRAVEL = {
     'BIK': { walk: 14, brisk: 11, run: 8 }
 };
 
-// Common SE20 destinations with known TIPLOCs (the journey planner also does a
-// full name-search across refByTiploc, so these are just fast-path aliases).
 const DESTINATIONS = {
     'victoria': ['VICTRIC', 'VICTRIA', 'VICTRIE', 'VICTRI'],
     'london bridge': ['LNDNBDE', 'LNDNBDG', 'LONBDGE', 'LONDONB'],
@@ -76,7 +63,6 @@ const DESTINATIONS = {
     'peckham rye': ['PCKHMRY', 'PCKMRYE']
 };
 
-// Which carriage to board at SE20 stations for quickest exit at common destinations
 const EXIT_POSITIONING = {
     'victoria': {
         'PNE': { carriage: 'front', exit: 'barriers', note: 'Front 2 carriages for main exit' },
@@ -106,7 +92,6 @@ const EXIT_POSITIONING = {
     }
 };
 
-// Crowding patterns for SE20 stations (scale 1=quiet … 4=packed)
 const crowdingPatterns = {
     'PNE': {
         peak: { weekday: [7, 8, 9, 17, 18, 19], weekend: [11, 12, 17, 18], level: 4 },
@@ -129,7 +114,6 @@ const crowdingPatterns = {
     }
 };
 
-// Connection walk times and success rates at common interchange stations
 const CONNECTION_STATS = {
     'london bridge': {
         'jubilee': { walkMins: 6, successRate: { tight: 65, normal: 92 } },
@@ -166,9 +150,9 @@ const CONNECTION_STATS = {
 // ============================================
 // STATION REFERENCE (TIPLOC <-> CRS <-> name <-> lat/lon)
 // ============================================
-const refByTiploc = new Map();   // TIPLOC -> {tiploc, crs, name, lat, lon}
-const refByCrs = new Map();      // CRS    -> {tiploc, crs, name, lat, lon}
-const refCoords = [];            // records with valid coords, for nearest lookup
+const refByTiploc = new Map();
+const refByCrs = new Map();
+const refCoords = [];
 
 function loadReference() {
     try {
@@ -176,11 +160,15 @@ function loadReference() {
         const arr = JSON.parse(raw);
         arr.forEach(e => {
             if (!e.tiploc || !e.crs) return;
-            const rec = { tiploc: e.tiploc, crs: e.crs, name: e.name || e.crs, lat: +e.lat || 0, lon: +e.lon || 0 };
+            const lat = +e.lat, lon = +e.lon;
+            const rec = { tiploc: e.tiploc, crs: e.crs, name: e.name || e.crs, lat, lon };
             refByTiploc.set(e.tiploc, rec);
             if (!refByCrs.has(e.crs)) refByCrs.set(e.crs, rec);
-            // Exclude LU/junction pseudo-stations (Z/X CRS) from nearest-match pool
-            if (rec.lat && rec.lon && !/^[ZX]/.test(rec.crs)) refCoords.push(rec);
+            // Exclude LU/junction pseudo-stations (Z/X CRS) and entries with invalid coords.
+            // Use Number.isFinite to correctly handle lon=0 (Greenwich meridian).
+            if (Number.isFinite(lat) && lat !== 0 && Number.isFinite(lon) && !/^[ZX]/.test(e.crs)) {
+                refCoords.push(rec);
+            }
         });
         console.log(`Loaded station reference: ${refByTiploc.size} TIPLOCs, ${refByCrs.size} CRS, ${refCoords.length} with coords`);
     } catch (e) {
@@ -212,17 +200,16 @@ function nearestCrs(lat, lon, maxKm = 1.2) {
 // ============================================
 // IN-MEMORY STORE (lazy, per-CRS)
 // ============================================
-const departures = {};           // CRS -> [ departure, ... ]
-const hot = new Map();           // CRS -> last-requested ms (Infinity = seed, never expires)
+const departures = {};
+const hot = new Map();
 SEED_CRS.forEach(c => hot.set(c, Infinity));
 
 function isHot(crs) {
     const t = hot.get(crs);
     return t !== undefined && (t === Infinity || (Date.now() - t) < HOT_TTL_MS);
 }
-function markHot(crs) { if (!SEED_CRS.includes(crs)) hot.set(crs, Date.now()); }
+function markHot(crs) { if (!SEED_CRS_SET.has(crs)) hot.set(crs, Date.now()); }
 
-// Line disruption state (updated from Darwin OW messages + TfL API)
 const lineStatus = {
     'Southern': { status: 'good', message: null, updatedAt: null },
     'Southeastern': { status: 'good', message: null, updatedAt: null },
@@ -230,24 +217,101 @@ const lineStatus = {
     'Tram': { status: 'good', message: null, updatedAt: null }
 };
 
-const serviceMessages = [];      // recent Darwin station alert messages
-const recentStations = new Set(); // TIPLOCs seen (for debug)
-const sampleMessages = [];       // raw message samples (for debug)
+const serviceMessages = [];
+const recentStations = new Set();
+const sampleMessages = [];
 
 let lastUpdate = null;
 let kafkaConnected = false;
 let messageCount = 0;
 
 // ============================================
+// TIME UTILITIES
+// ============================================
+
+// Darwin publishes times in UK local time (BST/GMT). Return minutes-since-midnight
+// in UK local time so calculateMinutes is correct year-round on a UTC server.
+function ukNowMins() {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Europe/London', hour: 'numeric', minute: 'numeric', hour12: false
+    }).formatToParts(new Date());
+    const h = parseInt(parts.find(p => p.type === 'hour').value);
+    const m = parseInt(parts.find(p => p.type === 'minute').value);
+    return h * 60 + m;
+}
+
+// Minutes from now until an "HH:MM" Darwin time (UK local).
+// Handles BST, midnight wrap, and delayed/early-morning trains correctly.
+function calculateMinutes(timeStr) {
+    if (!timeStr || typeof timeStr !== 'string' || !timeStr.includes(':')) return undefined;
+    const [hours, mins] = timeStr.split(':').map(Number);
+    if (!Number.isFinite(hours) || !Number.isFinite(mins)) return undefined;
+    const nowMins = ukNowMins();
+    const targetMins = hours * 60 + mins;
+    let diff = targetMins - nowMins;
+    // Clamp to ±12 h: resolves midnight ambiguity without the old `hours < 6` heuristic
+    if (diff > 720) diff -= 1440;
+    if (diff < -720) diff += 1440;
+    return Math.round(diff);
+}
+
+// Extract the best available time from a Darwin dep field for eviction decisions.
+// Prefers the live expected time (dep.at / dep['@t']) over the fixed scheduled time
+// so delayed trains aren't evicted at their scheduled departure.
+function evictionTime(d) {
+    const dep = d.dep;
+    if (dep && typeof dep === 'object') {
+        const live = dep.at || dep['@t'];
+        if (live && typeof live === 'string') return live;
+    }
+    if (typeof dep === 'string' && dep) return dep;
+    return d.ptd || d.wtd || null;
+}
+
+// Shared platform-extraction logic (single source of truth for all endpoints).
+function extractPlatform(plat) {
+    if (!plat) return '-';
+    if (typeof plat === 'string') return plat;
+    if (typeof plat === 'object') {
+        return plat[''] || plat.plat
+            || Object.values(plat).find(v => /^[0-9]+[A-Za-z]?$/.test(String(v))) || '-';
+    }
+    return '-';
+}
+
+// Shared expected-time extraction — handles both dep.at and dep['@t'] Darwin aliases.
+function extractExpectedTime(dep) {
+    if (!dep) return undefined;
+    if (typeof dep === 'object') return dep.at || dep['@t'] || undefined;
+    return dep;
+}
+
+// UK local hour for a given Date (handles BST correctly on a UTC server).
+function ukHourOf(date) {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Europe/London', hour: 'numeric', hour12: false
+    }).formatToParts(date);
+    return parseInt(parts.find(p => p.type === 'hour').value);
+}
+
+// UK local weekday string ('Mon'–'Sun') for a given Date.
+function ukWeekdayOf(date) {
+    return new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Europe/London', weekday: 'short'
+    }).format(date);
+}
+
+// ============================================
 // HELPER FUNCTIONS
 // ============================================
+
+// Use UK local time for crowding comparisons — crowdingPatterns are UK-calibrated.
 function getCrowdingLevel(stationCode, date = new Date()) {
     if (!date || !(date instanceof Date) || isNaN(date.getTime())) date = new Date();
     const patterns = crowdingPatterns[stationCode];
     if (!patterns) return { level: 1, label: 'unknown' };
-    const hour = date.getHours();
-    const day = date.getDay();
-    const isWeekday = day >= 1 && day <= 5;
+    const hour = ukHourOf(date);
+    const isWeekday = !['Sat', 'Sun'].includes(ukWeekdayOf(date));
     if (!isWeekday && patterns.peak?.weekend?.includes(hour)) {
         return { level: Math.max(2, patterns.peak.level - 1), label: 'moderate' };
     }
@@ -302,7 +366,7 @@ async function fetchOvergroundStatus() {
                 updatedAt: new Date()
             };
         }
-    } catch (e) { /* ignore — TfL outage shouldn't break the train boards */ }
+    } catch (e) { /* TfL outage shouldn't break train boards */ }
 }
 
 // ============================================
@@ -322,6 +386,14 @@ const kafka = new Kafka({
 });
 
 const consumer = kafka.consumer({ groupId: CONFIG.kafka.groupId });
+
+// Reset kafkaConnected and schedule a reconnect if the consumer crashes mid-stream.
+consumer.on(consumer.events.CRASH, async (e) => {
+    console.error('Kafka consumer crashed:', e.payload?.error?.message || e.payload?.error);
+    kafkaConnected = false;
+    try { await consumer.disconnect(); } catch (err) { /* ignore */ }
+    setTimeout(startKafkaConsumer, 30000);
+});
 
 function processDarwinMessage(message) {
     try {
@@ -355,8 +427,6 @@ function processDarwinMessage(message) {
 function processTrainStatus(ts) {
     if (!ts.Location) return;
     const locations = Array.isArray(ts.Location) ? ts.Location : [ts.Location];
-    const valid = locations.filter(l => l && l.tpl);
-    const finalDest = valid.length ? valid[valid.length - 1].tpl : null;
 
     locations.forEach(loc => {
         if (!loc || !loc.tpl) return;
@@ -366,10 +436,16 @@ function processTrainStatus(ts) {
         updateDeparture(crs, {
             rid: ts.rid, uid: ts.uid, ssd: ts.ssd, tpl: loc.tpl,
             pta: loc.pta, ptd: loc.ptd, wta: loc.wta, wtd: loc.wtd,
-            arr: loc.arr, dep: loc.dep, plat: loc.plat,
-            cancelled: loc.can === 'true',
-            delayed: !!ts.LateReason, lateReason: ts.LateReason,
-            destination: finalDest
+            arr: loc.arr, dep: loc.dep,
+            // Only include plat when Darwin actually provided it; omitting it prevents
+            // a TS update with no platform info from erasing a previously known platform.
+            ...(loc.plat !== undefined ? { plat: loc.plat } : {}),
+            // Darwin XSD declares `can` as xs:boolean; handle both string and boolean forms.
+            cancelled: loc.can === 'true' || loc.can === true,
+            delayed: !!ts.LateReason, lateReason: ts.LateReason
+            // destination intentionally omitted: TS Location lists are partial (only changed
+            // stops), so the last element is not reliably the train terminus. The authoritative
+            // terminus comes from the schedule's DT node via processSchedule.
         });
     });
 }
@@ -381,7 +457,9 @@ function processSchedule(schedule) {
         ...(schedule.IP ? (Array.isArray(schedule.IP) ? schedule.IP : [schedule.IP]) : []),
         ...(schedule.DT ? [schedule.DT] : [])
     ];
-    const destTpl = (schedule.DT && schedule.DT.tpl) || null;
+    // Only set destination when the DT (terminal) node is present; an IP-only
+    // schedule update should not overwrite a known terminus with null.
+    const destTpl = schedule.DT?.tpl || null;
 
     points.forEach(p => {
         if (!p || !p.tpl) return;
@@ -391,7 +469,9 @@ function processSchedule(schedule) {
         updateDeparture(crs, {
             rid: schedule.rid, uid: schedule.uid, ssd: schedule.ssd, tpl: p.tpl,
             toc: schedule.toc, pta: p.pta, ptd: p.ptd, wta: p.wta, wtd: p.wtd,
-            plat: p.plat, activity: p.act, destination: destTpl
+            ...(p.plat !== undefined ? { plat: p.plat } : {}),
+            activity: p.act,
+            ...(destTpl ? { destination: destTpl } : {})
         });
     });
 }
@@ -401,46 +481,57 @@ function processStationMessage(ow) {
     const stations = Array.isArray(ow.Station) ? ow.Station : [ow.Station];
     stations.forEach(station => {
         if (!station.crs) return;
+        // Always update line status (it checks SE20 lines internally).
+        updateLineStatusFromMessage(station.crs, ow.Msg, ow.Severity);
+        // Only queue service messages for SE20 stations — the nationwide Darwin firehose
+        // would otherwise fill the 20-slot ring with alerts from unrelated stations.
+        if (!SE20_LINES[station.crs]) return;
         serviceMessages.push({ station: station.crs, message: ow.Msg, severity: ow.Severity, timestamp: new Date() });
         if (serviceMessages.length > 20) serviceMessages.shift();
-        updateLineStatusFromMessage(station.crs, ow.Msg, ow.Severity);
     });
 }
 
 function updateDeparture(crs, trainData) {
     const list = departures[crs] || (departures[crs] = []);
     trainData.stationCode = crs;
-    const timeStr = trainData.ptd || trainData.wtd;
-    if (timeStr) trainData.mins = calculateMinutes(timeStr);
-    const i = list.findIndex(d => d.rid === trainData.rid);
-    if (i >= 0) list[i] = { ...list[i], ...trainData, updatedAt: Date.now() };
-    else list.push({ ...trainData, createdAt: Date.now(), updatedAt: Date.now() });
-    list.sort((a, b) => String(a.ptd || a.wtd || '99:99').localeCompare(String(b.ptd || b.wtd || '99:99')));
-    departures[crs] = list.filter(d => d.mins === undefined || d.mins >= -2).slice(0, MAX_PER_STATION);
-}
 
-function calculateMinutes(timeStr) {
-    if (!timeStr || typeof timeStr !== 'string' || !timeStr.includes(':')) return undefined;
-    const [hours, mins] = timeStr.split(':').map(Number);
-    if (!Number.isFinite(hours) || !Number.isFinite(mins)) return undefined;
-    const now = new Date();
-    const target = new Date();
-    target.setHours(hours, mins, 0, 0);
-    if (target < now && hours < 6) target.setDate(target.getDate() + 1);
-    return Math.round((target - now) / 60000);
+    // Use the live expected departure time (dep.at) when available so that delayed
+    // trains aren't evicted from the board at their scheduled departure time.
+    const refTime = evictionTime(trainData);
+    if (refTime) trainData.mins = calculateMinutes(refTime);
+
+    const i = list.findIndex(d => d.rid === trainData.rid);
+    if (i >= 0) {
+        const merged = { ...list[i], ...trainData, updatedAt: Date.now() };
+        // Preserve known destination and platform if the incoming update has neither —
+        // partial TS updates shouldn't erase data written by a schedule message.
+        if (merged.destination == null && list[i].destination != null) merged.destination = list[i].destination;
+        if (merged.plat == null && list[i].plat != null) merged.plat = list[i].plat;
+        list[i] = merged;
+    } else {
+        list.push({ ...trainData, createdAt: Date.now(), updatedAt: Date.now() });
+    }
+
+    // Sort numerically by calculated mins so midnight-spanning boards stay correct
+    // (localeCompare on 'HH:MM' strings puts 00:xx before 23:xx, inverting order).
+    list.sort((a, b) => (a.mins ?? 9999) - (b.mins ?? 9999));
+    departures[crs] = list.filter(d => d.mins === undefined || d.mins >= -2).slice(0, MAX_PER_STATION);
 }
 
 setInterval(() => {
     Object.keys(departures).forEach(crs => {
         if (!isHot(crs)) { delete departures[crs]; hot.delete(crs); return; }
-        departures[crs].forEach(d => { const t = d.ptd || d.wtd; if (t) d.mins = calculateMinutes(t); });
+        // Refresh mins using the live expected time (same logic as updateDeparture).
+        departures[crs].forEach(d => {
+            const t = evictionTime(d);
+            if (t) d.mins = calculateMinutes(t);
+        });
         departures[crs] = departures[crs].filter(d => d.mins === undefined || d.mins >= -2).slice(0, MAX_PER_STATION);
         if (departures[crs].length === 0) delete departures[crs];
     });
     hot.forEach((t, crs) => { if (t !== Infinity && (Date.now() - t) >= HOT_TTL_MS && !departures[crs]) hot.delete(crs); });
 }, 60 * 1000);
 
-// Refresh Overground status every 5 minutes
 setInterval(fetchOvergroundStatus, 5 * 60 * 1000);
 
 async function startKafkaConsumer() {
@@ -458,6 +549,9 @@ async function startKafkaConsumer() {
     } catch (error) {
         console.error('Failed to start Kafka consumer:', error.message);
         kafkaConnected = false;
+        // Disconnect before retrying: calling connect() again on an already-connected
+        // consumer causes a permanent "already running" error loop.
+        try { await consumer.disconnect(); } catch (e) { /* ignore */ }
         setTimeout(startKafkaConsumer, 30000);
     }
 }
@@ -466,26 +560,16 @@ async function startKafkaConsumer() {
 // FORMATTING
 // ============================================
 function formatDepartures(deps) {
-    return (deps || []).map(d => {
-        let platform = '-';
-        if (d.plat) {
-            if (typeof d.plat === 'string') platform = d.plat;
-            else if (typeof d.plat === 'object') {
-                platform = d.plat[''] || d.plat.plat
-                    || Object.values(d.plat).find(v => /^[0-9]+[A-Za-z]?$/.test(String(v))) || '-';
-            }
-        }
-        return {
-            destination: nameForTiploc(d.destination) || d.destination || 'Unknown',
-            scheduledTime: d.ptd || d.wtd || '',
-            expectedTime: typeof d.dep === 'object' ? (d.dep && (d.dep.at || d.dep['@t'])) : d.dep,
-            platform,
-            mins: d.mins,
-            cancelled: d.cancelled || false,
-            delayed: d.delayed || false,
-            lateReason: d.lateReason
-        };
-    });
+    return (deps || []).map(d => ({
+        destination: nameForTiploc(d.destination) || d.destination || 'Unknown',
+        scheduledTime: d.ptd || d.wtd || '',
+        expectedTime: extractExpectedTime(d.dep),
+        platform: extractPlatform(d.plat),
+        mins: d.mins,
+        cancelled: d.cancelled || false,
+        delayed: d.delayed || false,
+        lateReason: d.lateReason
+    }));
 }
 
 // ============================================
@@ -498,7 +582,6 @@ app.get('/health', (req, res) => {
     });
 });
 
-// Live board for ANY station — by ?crs=XXX or by ?lat=..&lon=.. (nearest station).
 app.get('/api/board', (req, res) => {
     let crs = (req.query.crs || '').toString().trim().toUpperCase();
     if (!crs && req.query.lat != null && req.query.lon != null) {
@@ -518,7 +601,6 @@ app.get('/api/board', (req, res) => {
     });
 });
 
-// Back-compat: SE20 home-area board.
 app.get('/api/departures', (req, res) => {
     const stations = {};
     SEED_CRS.forEach(crs => {
@@ -528,7 +610,6 @@ app.get('/api/departures', (req, res) => {
     res.json({ timestamp: new Date(), lastUpdate, stations });
 });
 
-// Back-compat: single station by CRS.
 app.get('/api/departures/:station', (req, res) => {
     const crs = req.params.station.toUpperCase();
     if (!refByCrs.has(crs)) return res.status(404).json({ error: 'Station not found' });
@@ -540,16 +621,12 @@ app.get('/api/departures/:station', (req, res) => {
     });
 });
 
-// Journey planner — find trains from SE20 to any destination.
-// Searches the full reference (nationwide), not just the old hand-typed table.
+// Journey planner — from SE20 stations only (SEED_CRS); nationwide destinations.
 app.get('/api/journey/:destination', (req, res) => {
     const query = req.params.destination.toLowerCase().replace(/[^a-z0-9 ]/g, '');
 
     const matchingTiplocs = new Set();
-    if (DESTINATIONS[query]) {
-        DESTINATIONS[query].forEach(t => matchingTiplocs.add(t));
-    }
-    // Also search the full reference so any station name works
+    if (DESTINATIONS[query]) DESTINATIONS[query].forEach(t => matchingTiplocs.add(t));
     refByTiploc.forEach((rec, tiploc) => {
         if (rec.name.toLowerCase().includes(query)) matchingTiplocs.add(tiploc);
     });
@@ -562,36 +639,35 @@ app.get('/api/journey/:destination', (req, res) => {
     const matchedName = nameForTiploc(firstTiploc) || firstTiploc;
 
     const options = [];
-    Object.entries(departures).forEach(([crsCode, deps]) => {
-        const walkMins = SE20_WALK[crsCode] || 5;
+    // Restrict to SE20 departure stations — non-SE20 hot stations don't have meaningful walk times.
+    SEED_CRS.forEach(crsCode => {
+        const deps = departures[crsCode];
+        if (!deps) return;
+        const walkMins = SE20_WALK[crsCode];
         const stationName = refByCrs.get(crsCode)?.name || crsCode;
-        const line = SE20_LINES[crsCode] || 'National Rail';
+        const line = SE20_LINES[crsCode];
         deps.forEach(d => {
             if (!matchingTiplocs.has(d.destination)) return;
             if (d.cancelled) return;
-            const scheduledTime = d.ptd || d.wtd;
-            if (!scheduledTime) return;
-            const minsUntilDeparture = calculateMinutes(scheduledTime);
+            const minsUntilDeparture = d.mins;
             if (minsUntilDeparture === undefined || minsUntilDeparture < -1) return;
-            let platform = '-';
-            if (d.plat) {
-                if (typeof d.plat === 'string') platform = d.plat;
-                else if (typeof d.plat === 'object') platform = d.plat[''] || d.plat.plat || Object.values(d.plat).find(v => /^[0-9]+[A-Za-z]?$/.test(String(v))) || '-';
-            }
             options.push({
                 station: stationName, stationCode: crsCode, line, walkMins,
-                scheduledTime, expectedTime: typeof d.dep === 'object' ? d.dep?.at : d.dep,
-                platform, leaveInMins: minsUntilDeparture - walkMins,
+                scheduledTime: d.ptd || d.wtd || '',
+                expectedTime: extractExpectedTime(d.dep),
+                platform: extractPlatform(d.plat),
+                leaveInMins: minsUntilDeparture - walkMins,
                 delayed: d.delayed || false, lateReason: d.lateReason
             });
         });
     });
 
     options.sort((a, b) => a.leaveInMins - b.leaveInMins);
-    res.json({ timestamp: new Date(), lastUpdate, destination: matchedName, options });
+    const status = options.length === 0 ? 'no_trains' : 'ok';
+    res.json({ timestamp: new Date(), lastUpdate, destination: matchedName, status, options });
 });
 
-// Smart "best option" with scoring, crowding, and exit positioning.
+// Best option with scoring, crowding, and exit positioning — SE20 departure stations only.
 app.get('/api/best/:destination', (req, res) => {
     const query = req.params.destination.toLowerCase().replace(/[^a-z0-9 ]/g, '');
     const speed = ['walk', 'brisk', 'run'].includes(req.query.speed) ? req.query.speed : 'walk';
@@ -608,26 +684,20 @@ app.get('/api/best/:destination', (req, res) => {
     const matchedName = nameForTiploc(firstTiploc) || firstTiploc;
 
     const options = [];
-    Object.entries(departures).forEach(([crsCode, deps]) => {
-        const travelTimes = SE20_TRAVEL[crsCode] || { walk: 5, brisk: 4, run: 3 };
-        const travelMins = travelTimes[speed] || travelTimes.walk;
+    SEED_CRS.forEach(crsCode => {
+        const deps = departures[crsCode];
+        if (!deps) return;
+        const travelTimes = SE20_TRAVEL[crsCode];
+        const travelMins = travelTimes[speed];
         const stationName = refByCrs.get(crsCode)?.name || crsCode;
-        const line = SE20_LINES[crsCode] || 'National Rail';
+        const line = SE20_LINES[crsCode];
         const lineState = lineStatus[line] || { status: 'good' };
 
         deps.forEach(d => {
             if (!matchingTiplocs.has(d.destination)) return;
             if (d.cancelled) return;
-            const scheduledTime = d.ptd || d.wtd;
-            if (!scheduledTime) return;
-            const minsUntilDeparture = calculateMinutes(scheduledTime);
+            const minsUntilDeparture = d.mins;
             if (minsUntilDeparture === undefined || minsUntilDeparture < -3) return;
-
-            let platform = '-';
-            if (d.plat) {
-                if (typeof d.plat === 'string') platform = d.plat;
-                else if (typeof d.plat === 'object') platform = d.plat[''] || d.plat.plat || Object.values(d.plat).find(v => /^[0-9]+[A-Za-z]?$/.test(String(v))) || '-';
-            }
 
             const leaveInMins = minsUntilDeparture - travelMins;
             let score = leaveInMins < 0 ? 1000 : leaveInMins;
@@ -636,16 +706,20 @@ app.get('/api/best/:destination', (req, res) => {
                 score += sev <= 5 ? 40 : (sev <= 8 ? 20 : 10);
             }
             if (d.delayed) {
-                const m = d.lateReason?.match(/(\d+)\s*min/i);
-                score += m ? Math.min(parseInt(m[1]), 30) : 15;
+                // Guard: lateReason can be a non-string object in some Darwin frames
+                const delayMatch = typeof d.lateReason === 'string' ? d.lateReason.match(/(\d+)\s*min/i) : null;
+                score += delayMatch ? Math.min(parseInt(delayMatch[1]), 30) : 15;
             }
             if (leaveInMins < 2 && leaveInMins >= 0) score -= 5;
 
             options.push({
-                station: stationName, stationCode: crsCode, line, lineStatus: lineState.status, lineMessage: lineState.message,
-                travelMins, travelTimes, speed, scheduledTime,
-                expectedTime: typeof d.dep === 'object' ? d.dep?.at : d.dep,
-                platform, leaveInMins, catchable: leaveInMins >= 0,
+                station: stationName, stationCode: crsCode, line,
+                lineStatus: lineState.status, lineMessage: lineState.message,
+                travelMins, travelTimes, speed,
+                scheduledTime: d.ptd || d.wtd || '',
+                expectedTime: extractExpectedTime(d.dep),
+                platform: extractPlatform(d.plat),
+                leaveInMins, catchable: leaveInMins >= 0,
                 canCatch: { walk: minsUntilDeparture >= travelTimes.walk, brisk: minsUntilDeparture >= travelTimes.brisk, run: minsUntilDeparture >= travelTimes.run },
                 delayed: d.delayed || false, lateReason: d.lateReason,
                 crowding: getCrowdingLevel(crsCode),
@@ -665,10 +739,14 @@ app.get('/api/best/:destination', (req, res) => {
     } : null;
     const disruption = best && lineStatus[best.line]?.status === 'disrupted' ? {
         line: best.line, message: lineStatus[best.line].message,
-        alternative: options.find(o => o.line !== best.line && lineStatus[o.line]?.status !== 'disrupted')
+        alternative: options.find(o => o.line !== best.line && lineStatus[o.line]?.status !== 'disrupted') || null
     } : null;
-    const quieterOption = best?.crowding?.level >= 3 ? options.find(o => o !== best && o.catchable && o.crowding?.level < best.crowding.level) : null;
-    const runOption = !best?.catchable ? options.find(o => o.canCatch?.run && !o.canCatch?.walk) : null;
+    const quieterOption = best?.crowding?.level >= 3
+        ? options.find(o => o !== best && o.catchable && o.crowding?.level < best.crowding.level) || null
+        : null;
+    const runOption = !best?.catchable
+        ? options.find(o => o.canCatch?.run && !o.canCatch?.walk) || null
+        : null;
 
     let status = 'ok';
     if (options.length === 0) status = 'no_trains';
@@ -684,7 +762,9 @@ app.get('/api/status/lines', (req, res) => {
 app.get('/api/connection/:station/:line', (req, res) => {
     const station = req.params.station.replace(/-/g, ' ');
     const line = req.params.line.toLowerCase().replace(/-/g, '_');
-    const bufferMins = parseInt(req.query.buffer) || 6;
+    // Use ?? to correctly handle buffer=0 (caller already at interchange).
+    const bufferRaw = parseInt(req.query.buffer);
+    const bufferMins = Number.isFinite(bufferRaw) ? bufferRaw : 6;
     const risk = getConnectionRisk(station, line, bufferMins);
     if (!risk) return res.status(404).json({ error: 'Connection not found', hint: 'Try: /api/connection/london-bridge/jubilee?buffer=5' });
     res.json({ timestamp: new Date(), station, connection: line, ...risk });
@@ -698,7 +778,8 @@ app.get('/api/crowding/:station', (req, res) => {
     for (let i = 0; i < 6; i++) {
         const time = new Date(now.getTime() + i * 60 * 60 * 1000);
         const crowding = getCrowdingLevel(crs, time);
-        predictions.push({ hour: time.getHours(), time: `${time.getHours().toString().padStart(2, '0')}:00`, ...crowding });
+        const hour = ukHourOf(time);
+        predictions.push({ hour, time: `${String(hour).padStart(2, '0')}:00`, ...crowding });
     }
     res.json({ timestamp: new Date(), station: refByCrs.get(crs)?.name || crs, current: getCrowdingLevel(crs), predictions });
 });
@@ -716,7 +797,6 @@ app.get('/api/status', (req, res) => {
     });
 });
 
-// Debug endpoints
 app.get('/api/debug/samples', (req, res) => {
     res.json({ messageCount, sampleMessages });
 });
@@ -732,7 +812,7 @@ app.get('/api/debug/raw', (req, res) => {
     Object.keys(departures).forEach(crs => {
         rawData[crs] = departures[crs].map(d => ({
             destination: d.destination, resolvedName: nameForTiploc(d.destination) || 'Unknown',
-            scheduledTime: d.ptd || d.wtd, platform: d.plat
+            scheduledTime: d.ptd || d.wtd, platform: d.plat, mins: d.mins
         }));
     });
     res.json({ rawData, hotStations: Array.from(hot.keys()), trackedCRS: Object.keys(departures) });

@@ -182,7 +182,7 @@ function tiplocToCrs(tiploc) { const r = refByTiploc.get(tiploc); return r ? r.c
 function nameForTiploc(tiploc) { const r = refByTiploc.get(tiploc); return r ? r.name : null; }
 
 // Strip punctuation so "King's Cross" matches query "kings cross" (and vice versa).
-function normaliseName(s) { return s.toLowerCase().replace(/[^a-z0-9 ]/g, ''); }
+function normaliseName(s) { return s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
 
 function haversineKm(a1, o1, a2, o2) {
     const R = 6371, toR = Math.PI / 180;

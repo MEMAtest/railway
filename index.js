@@ -184,6 +184,105 @@ function nameForTiploc(tiploc) { const r = refByTiploc.get(tiploc); return r ? r
 // Strip punctuation so "King's Cross" matches query "kings cross" (and vice versa).
 function normaliseName(s) { return s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
 
+// Darwin passenger-facing reason codes (source: Open Rail wiki Darwin:Late_Running_reason_codes)
+const LATE_REASONS = {
+    '1':'a passenger accident at a station','2':'the late finish of a previous working',
+    '3':'a delay in a previous station working','4':'a train equipment problem',
+    '5':'an operational problem','6':'a train late from a maintenance depot',
+    '7':'a train late from a stabling location','8':'a train late into a terminus',
+    '9':'a joining delay','10':'an overcrowding delay','11':'a door-fault delay',
+    '18':'a late-running freight train','19':'congestion caused by a late-running train',
+    '21':'an operational problem at another station',
+    '22':'a delay caused by a freight train','23':'an engineering works overrun',
+    '24':'a track defect','25':'a points failure','26':'a signal failure',
+    '27':'a level crossing problem','28':'a track circuit failure',
+    '29':'a broken rail','30':'a bridge defect','31':'a lineside fire',
+    '32':'an animal on the line','33':'a person on the line',
+    '34':'a fatality on the line','35':'a vandalism or theft incident',
+    '36':'a trespass incident','37':'a security alert',
+    '38':'a police incident','39':'a medical emergency on a train',
+    '40':'a medical emergency at a station','41':'a passenger taken ill',
+    '42':'an unstaffed train','43':'a driver shortage','44':'a conductor shortage',
+    '45':'a fleet shortfall','46':'rolling stock short-forming',
+    '47':'a shortage of available trains','51':'overhead line damage',
+    '52':'power supply problems','53':'a third rail problem',
+    '54':'a cable fire','55':'cable theft',
+    '101':'a train equipment problem','102':'a door-fault delay',
+    '103':'a train fault','104':'a fleet maintenance problem',
+    '105':'a rolling stock problem','106':'a train defect',
+    '107':'a train crew issue','108':'a driver unavailability',
+    '109':'a conductor unavailability','110':'a staff shortage',
+    '111':'a train operating company operational problem',
+    '112':'a Network Rail operational problem',
+    '113':'an earlier trespassing incident','114':'an earlier fatality',
+    '115':'an earlier vandalism incident','116':'overhead line problems',
+    '117':'a power supply problem','118':'congestion on the network',
+    '119':'a late-running connecting service','120':'a delay at another station',
+    '121':'congestion causing knock-on delays','122':'station equipment failure',
+    '123':'a lineside equipment failure','124':'a bus service failure',
+    '125':'adverse weather conditions','126':'a track defect',
+    '127':'animals on the line','128':'a fatality on the railway',
+    '129':'a landslide','130':'rough shunting movements',
+    '131':'an empty stock movement','132':'an earlier delay',
+    '133':'an operational problem','134':'loss of electrical supply',
+    '135':'congestion','136':'a passenger illness','137':'an earlier incident',
+    '138':'a crew-related delay','139':'an Underground delay',
+    '140':'industrial action','141':'a disruption at another station',
+    '142':'an incident outside the station','143':'a security alert',
+    '144':'a signalling problem','145':'a track circuit failure',
+    '146':'a signal failure','147':'a points failure',
+    '148':'a track defect','149':'a level crossing problem',
+    '150':'a lineside fire','151':'a bridge strike',
+    '152':'a level crossing breakdown','153':'a junction problem',
+    '154':'a train derailment','155':'a train collision',
+    '156':'engineering works overrunning','157':'planned engineering overrun',
+    '158':'a track worker protection warning','159':'a fire at a station',
+    '160':'a fire on a train','161':'a fire near the railway',
+    '162':'a lineside fire','163':'an earlier fire','164':'a fire on the track',
+    '165':'a person trespassing on the line','166':'a person hit by a train',
+    '167':'a police incident','168':'a police request to stop',
+    '169':'a suspicious package investigation','170':'a medical emergency',
+    '171':'an emergency services incident','172':'poor weather conditions',
+    '173':'high winds','174':'flooding','175':'snowfall',
+    '176':'slippery rails','177':'an international service delay',
+    '178':'a cross-Channel delay','179':'congestion',
+    '180':'a road vehicle blocking the line','181':'a person on the line',
+    '182':'animals on the line','183':'a previous delay'
+};
+const CANCEL_REASONS = {
+    '1':'cancellation due to an operational problem',
+    '2':'cancellation due to the late running of a previous service',
+    '17':'a shortage of trains',
+    '18':'a late-running freight train',
+    '20':'a scheduling change',
+    '21':'an operational problem at another station',
+    '22':'a delay caused by a freight train',
+    '31':'a lineside fire','32':'animals on the line','33':'a person on the line',
+    '34':'a fatality on the line','36':'a trespass incident','37':'a security alert',
+    '38':'a police incident','51':'overhead line damage','52':'power supply problems',
+    '101':'a train equipment problem','107':'a train crew issue',
+    '113':'an earlier trespassing incident','114':'an earlier fatality',
+    '115':'an earlier vandalism incident','116':'overhead line problems',
+    '118':'congestion on the network','121':'congestion causing knock-on delays',
+    '125':'adverse weather conditions','128':'a fatality on the railway',
+    '131':'an empty stock movement','140':'industrial action',
+    '143':'a security alert','144':'a signalling problem',
+    '145':'a track circuit failure','146':'a signal failure','147':'a points failure',
+    '154':'a train derailment','155':'a train collision',
+    '156':'engineering works overrunning','157':'planned engineering overrun',
+    '160':'a fire on a train','165':'a person trespassing on the line',
+    '166':'a person hit by a train','167':'a police incident',
+    '172':'poor weather conditions','173':'high winds','174':'flooding',
+    '176':'slippery rails','180':'a road vehicle blocking the line',
+    '181':'a person on the line'
+};
+
+function resolveReasonCode(raw, table) {
+    if (!raw) return null;
+    const code = (typeof raw === 'object') ? (raw['@value'] || raw['#text'] || '') : String(raw);
+    return table[code.trim()] || null;
+}
+
 function haversineKm(a1, o1, a2, o2) {
     const R = 6371, toR = Math.PI / 180;
     const dLat = (a2 - a1) * toR, dLon = (o2 - o1) * toR;
@@ -448,7 +547,9 @@ function processTrainStatus(ts) {
             arr: loc.arr, dep: loc.dep,
             ...(loc.plat !== undefined ? { plat: loc.plat } : {}),
             cancelled: loc.can === 'true' || loc.can === true,
-            delayed: !!ts.LateReason, lateReason: ts.LateReason
+            delayed: !!ts.LateReason,
+            lateReason: resolveReasonCode(ts.LateReason, LATE_REASONS),
+            cancelReason: resolveReasonCode(ts.CancelReason, CANCEL_REASONS)
             // destination intentionally omitted: TS Location lists are partial (only changed
             // stops), so the last element is not reliably the train terminus. The authoritative
             // terminus comes from the schedule's DT node via processSchedule / ridToDestination.
@@ -469,9 +570,12 @@ function processSchedule(schedule) {
     // before the schedule message propagates to updateDeparture.
     if (destTpl && schedule.rid) {
         ridToDestination.set(schedule.rid, destTpl);
-        // Prevent unbounded growth — RIDs are service-day scoped so old ones expire naturally,
-        // but a hard cap ensures we don't leak memory on multi-day process lifetimes.
-        if (ridToDestination.size > 50000) ridToDestination.clear();
+        // Prevent unbounded growth. Half-clear (oldest 25k) instead of a full wipe so a
+        // thundering herd of "Unknown" destinations doesn't appear after an overflow.
+        if (ridToDestination.size > 50000) {
+            const keys = [...ridToDestination.keys()];
+            keys.slice(0, 25000).forEach(k => ridToDestination.delete(k));
+        }
     }
 
     points.forEach(p => {
@@ -585,16 +689,24 @@ async function startKafkaConsumer() {
 // FORMATTING
 // ============================================
 function formatDepartures(deps) {
-    return (deps || []).map(d => ({
-        destination: nameForTiploc(d.destination) || d.destination || 'Unknown',
-        scheduledTime: d.ptd || d.wtd || '',
-        expectedTime: extractExpectedTime(d.dep),
-        platform: extractPlatform(d.plat),
-        mins: d.mins,
-        cancelled: d.cancelled || false,
-        delayed: d.delayed || false,
-        lateReason: d.lateReason
-    }));
+    return (deps || []).map(d => {
+        // Last-chance destination lookup: schedule messages may arrive after TS updates,
+        // so the ridToDestination map may now have a TIPLOC that wasn't set at ingest time.
+        const destTiploc = d.destination
+            || (d.rid && ridToDestination.has(d.rid) ? ridToDestination.get(d.rid) : null);
+        const destination = nameForTiploc(destTiploc) || null; // null = frontend drops the row
+        const reason = d.lateReason || d.cancelReason || null;
+        return {
+            destination,
+            scheduledTime: d.ptd || d.wtd || '',
+            expectedTime: extractExpectedTime(d.dep),
+            platform: extractPlatform(d.plat),
+            mins: d.mins,
+            cancelled: d.cancelled || false,
+            delayed: d.delayed || false,
+            reason
+        };
+    });
 }
 
 // ============================================
@@ -683,7 +795,7 @@ app.get('/api/journey/:destination', (req, res) => {
                 expectedTime: extractExpectedTime(d.dep),
                 platform: extractPlatform(d.plat),
                 leaveInMins: minsUntilDeparture - walkMins,
-                delayed: d.delayed || false, lateReason: d.lateReason
+                delayed: d.delayed || false, reason: d.reason || d.lateReason || null
             });
         });
     });
@@ -732,10 +844,7 @@ app.get('/api/best/:destination', (req, res) => {
                 const sev = lineState.severity ?? 5;
                 score += sev <= 5 ? 40 : (sev <= 8 ? 20 : 10);
             }
-            if (d.delayed) {
-                const delayMatch = typeof d.lateReason === 'string' ? d.lateReason.match(/(\d+)\s*min/i) : null;
-                score += delayMatch ? Math.min(parseInt(delayMatch[1]), 30) : 15;
-            }
+            if (d.delayed) score += 15;
             if (leaveInMins < 2 && leaveInMins >= 0) score -= 5;
 
             options.push({
@@ -747,7 +856,7 @@ app.get('/api/best/:destination', (req, res) => {
                 platform: extractPlatform(d.plat),
                 leaveInMins, catchable: leaveInMins >= 0,
                 canCatch: { walk: minsUntilDeparture >= travelTimes.walk, brisk: minsUntilDeparture >= travelTimes.brisk, run: minsUntilDeparture >= travelTimes.run },
-                delayed: d.delayed || false, lateReason: d.lateReason,
+                delayed: d.delayed || false, reason: d.reason || d.lateReason || null,
                 crowding: getCrowdingLevel(crsCode),
                 exitAdvice: getExitAdvice(matchedName, crsCode),
                 score

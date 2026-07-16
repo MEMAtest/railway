@@ -279,7 +279,9 @@ const CANCEL_REASONS = {
 
 function resolveReasonCode(raw, table) {
     if (!raw) return null;
-    const code = (typeof raw === 'object') ? (raw['@value'] || raw['#text'] || '') : String(raw);
+    // Darwin JSON encodes XML text content as the empty-string key when attributes are present
+    // (same pattern extractPlatform already handles for plat objects).
+    const code = (typeof raw === 'object') ? (raw[''] || raw['@value'] || raw['#text'] || '') : String(raw);
     return table[code.trim()] || null;
 }
 

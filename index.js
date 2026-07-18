@@ -336,6 +336,10 @@ const ridToDestination = new Map();
 // schedule (OR + IP + DT), so a departure can show "does this train stop at X?".
 const ridToCalling = new Map();
 
+// `${rid}:${crs}` -> [{n, pct}] per-coach loading at that station, from Darwin
+// formationLoading messages (TOC-dependent; ~a third of operators populate it).
+const ridLoading = new Map();
+
 let lastUpdate = null;
 let kafkaConnected = false;
 let messageCount = 0;
@@ -551,6 +555,10 @@ function processDarwinMessage(message) {
                 const arr = Array.isArray(data.uR.OW) ? data.uR.OW : [data.uR.OW];
                 arr.forEach(ow => processStationMessage(ow));
             }
+            if (data.uR.formationLoading) {
+                const arr = Array.isArray(data.uR.formationLoading) ? data.uR.formationLoading : [data.uR.formationLoading];
+                arr.forEach(fl => processFormationLoading(fl));
+            }
         }
         lastUpdate = new Date();
     } catch (e) { /* ignore malformed frames */ }
@@ -640,6 +648,26 @@ function processStationMessage(ow) {
         serviceMessages.push({ station: station.crs, message: ow.Msg, severity: ow.Severity, timestamp: new Date() });
         if (serviceMessages.length > 20) serviceMessages.shift();
     });
+}
+
+// Darwin formationLoading: per-coach loading percentages for a service at one
+// calling point. Stored keyed by rid+CRS so a board can show how busy each coach
+// is at THAT station. The loading value is under the empty-string key (XML text).
+function processFormationLoading(fl) {
+    if (!fl || !fl.rid || !fl.tpl) return;
+    const crs = tiplocToCrs(fl.tpl);
+    if (!crs) return;
+    const arr = Array.isArray(fl.loading) ? fl.loading : (fl.loading ? [fl.loading] : []);
+    const coaches = arr.map(l => ({
+        n: l.coachNumber,
+        pct: parseInt(l[''] ?? l['#text'] ?? l.loadingValue, 10)
+    })).filter(c => c.n != null && Number.isFinite(c.pct));
+    if (!coaches.length) return;
+    ridLoading.set(`${fl.rid}:${crs}`, coaches);
+    if (ridLoading.size > 30000) {
+        const keys = [...ridLoading.keys()];
+        keys.slice(0, 15000).forEach(k => ridLoading.delete(k));
+    }
 }
 
 function keepEntry(d) {
@@ -744,7 +772,9 @@ function formatDepartures(deps, originCrs) {
             reason,
             rid: d.rid || null,   // lets the client fetch this service's calling pattern
             // "Which carriage" boarding advice (curated), when we know the origin station.
-            exitAdvice: (originCrs && destination) ? getExitAdvice(destination, originCrs) : null
+            exitAdvice: (originCrs && destination) ? getExitAdvice(destination, originCrs) : null,
+            // Per-coach loading at this station, when the operator publishes it.
+            loading: (originCrs && d.rid && ridLoading.has(`${d.rid}:${originCrs}`)) ? ridLoading.get(`${d.rid}:${originCrs}`) : null
         };
     });
 }

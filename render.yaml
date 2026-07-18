@@ -15,3 +15,11 @@ services:
         sync: false
       - key: KAFKA_PASSWORD
         sync: false
+      # Web-push VAPID keys — generate with `npx web-push generate-vapid-keys`
+      # and set in the Render dashboard. Without them, push is disabled.
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        sync: false

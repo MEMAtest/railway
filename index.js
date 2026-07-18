@@ -14,10 +14,73 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const { Kafka } = require('kafkajs');
+const webpush = require('web-push');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ============================================
+// WEB PUSH (platform-change / cancellation alerts for a tracked train)
+// VAPID keys are set in the Render dashboard, never committed. Without them,
+// push is disabled and the endpoints degrade gracefully.
+// ============================================
+const VAPID_PUBLIC = (process.env.VAPID_PUBLIC_KEY || '').trim();
+const VAPID_PRIVATE = (process.env.VAPID_PRIVATE_KEY || '').trim();
+const VAPID_SUBJECT = (process.env.VAPID_SUBJECT || 'mailto:alerts@tremaine-159cf.web.app').trim();
+const pushEnabled = !!(VAPID_PUBLIC && VAPID_PRIVATE);
+if (pushEnabled) {
+    try { webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE); }
+    catch (e) { console.error('Invalid VAPID keys:', e.message); }
+}
+// endpoint -> { subscription, rid, crs, dest, scheduledTime, lastPlat, lastCancelled, createdAt }
+const pushSubs = new Map();
+const PUSH_TTL_MS = 6 * 60 * 60 * 1000;   // same-day services; drop stale subs after 6h
+
+async function sendPush(sub, payload) {
+    if (!pushEnabled) return;
+    try {
+        await webpush.sendNotification(sub.subscription, JSON.stringify(payload));
+    } catch (e) {
+        // 404/410 = subscription gone (unsubscribed / expired) — forget it.
+        if (e.statusCode === 404 || e.statusCode === 410) pushSubs.delete(sub.subscription.endpoint);
+    }
+}
+
+// Called from updateDeparture when a train updates: fire a push to anyone tracking
+// this rid at this station if its platform was newly assigned/changed or it's cancelled.
+function maybeNotifyPush(crs, merged) {
+    if (!pushEnabled || pushSubs.size === 0 || !merged.rid) return;
+    const plat = extractPlatform(merged.plat);
+    const cancelled = !!merged.cancelled;
+    for (const sub of pushSubs.values()) {
+        if (sub.rid !== merged.rid || sub.crs !== crs) continue;
+        if (plat && plat !== '-' && plat !== sub.lastPlat) {
+            const changed = sub.lastPlat && sub.lastPlat !== '-';
+            sendPush(sub, {
+                title: changed ? `⚠️ Platform changed — ${sub.dest}` : `🚉 Platform ${plat} — ${sub.dest}`,
+                body: changed
+                    ? `Your ${sub.scheduledTime} to ${sub.dest} moved to Platform ${plat} (was ${sub.lastPlat}).`
+                    : `Your ${sub.scheduledTime} to ${sub.dest} will depart from Platform ${plat}.`,
+                tag: `plat-${sub.rid}`
+            });
+            sub.lastPlat = plat;
+        }
+        if (cancelled && !sub.lastCancelled) {
+            sendPush(sub, {
+                title: `❌ Cancelled — ${sub.dest}`,
+                body: `Your ${sub.scheduledTime} to ${sub.dest} has been cancelled.`,
+                tag: `cancel-${sub.rid}`
+            });
+            sub.lastCancelled = true;
+        }
+    }
+}
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [ep, sub] of pushSubs) if (now - sub.createdAt > PUSH_TTL_MS) pushSubs.delete(ep);
+}, 10 * 60 * 1000);
 
 // ============================================
 // CONFIGURATION
@@ -702,6 +765,7 @@ function updateDeparture(crs, trainData) {
             merged.destination = ridToDestination.get(merged.rid);
         }
         list[i] = merged;
+        maybeNotifyPush(crs, merged);
     } else {
         list.push({ ...trainData, createdAt: Date.now(), updatedAt: Date.now() });
     }
@@ -808,6 +872,34 @@ app.get('/api/board', (req, res) => {
         warming: board.length === 0,
         departures: formatDepartures(board, crs)
     });
+});
+
+// ---- Web push: VAPID public key + subscribe/unsubscribe for a tracked train ----
+app.get('/api/push/vapid', (req, res) => {
+    res.json({ publicKey: VAPID_PUBLIC || null, enabled: pushEnabled });
+});
+
+app.post('/api/push/subscribe', (req, res) => {
+    if (!pushEnabled) return res.status(503).json({ error: 'push not configured' });
+    const { subscription, rid, crs, dest, scheduledTime, platform } = req.body || {};
+    if (!subscription || !subscription.endpoint || !rid || !crs) {
+        return res.status(400).json({ error: 'subscription, rid and crs are required' });
+    }
+    const CRS = String(crs).toUpperCase();
+    markHot(CRS);   // keep the tracked station warm so we keep seeing its updates
+    pushSubs.set(subscription.endpoint, {
+        subscription, rid, crs: CRS, dest: dest || 'your train',
+        scheduledTime: scheduledTime || '', lastPlat: platform || '-',
+        lastCancelled: false, createdAt: Date.now()
+    });
+    res.json({ ok: true, tracking: { rid, crs: CRS } });
+});
+
+app.post('/api/push/unsubscribe', (req, res) => {
+    const b = req.body || {};
+    const ep = b.endpoint || (b.subscription && b.subscription.endpoint);
+    if (ep) pushSubs.delete(ep);
+    res.json({ ok: true });
 });
 
 // Calling pattern for a single service (rid), resolved to station names.

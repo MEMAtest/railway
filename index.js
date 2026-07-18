@@ -330,6 +330,10 @@ const sampleMessages = [];
 // messages arriving before their schedule can still resolve their destination.
 const ridToDestination = new Map();
 
+// rid -> ordered calling pattern [{tpl, t, can}]: the full stop list from the
+// schedule (OR + IP + DT), so a departure can show "does this train stop at X?".
+const ridToCalling = new Map();
+
 let lastUpdate = null;
 let kafkaConnected = false;
 let messageCount = 0;
@@ -580,6 +584,19 @@ function processSchedule(schedule) {
         }
     }
 
+    // Store the ordered calling pattern for this service (for "does it stop at X?").
+    if (schedule.rid && points.length) {
+        ridToCalling.set(schedule.rid, points.map(p => ({
+            tpl: p.tpl,
+            t: p.ptd || p.pta || p.wtd || p.wta || '',
+            can: p.can === 'true' || p.can === true
+        })));
+        if (ridToCalling.size > 50000) {
+            const keys = [...ridToCalling.keys()];
+            keys.slice(0, 25000).forEach(k => ridToCalling.delete(k));
+        }
+    }
+
     points.forEach(p => {
         if (!p || !p.tpl) return;
         if (recentStations.size < 15000) recentStations.add(p.tpl);
@@ -706,7 +723,8 @@ function formatDepartures(deps) {
             mins: d.mins,
             cancelled: d.cancelled || false,
             delayed: d.delayed || false,
-            reason
+            reason,
+            rid: d.rid || null   // lets the client fetch this service's calling pattern
         };
     });
 }
@@ -737,6 +755,23 @@ app.get('/api/board', (req, res) => {
         station: { crs, name: rec.name, lat: rec.lat, lon: rec.lon },
         warming: board.length === 0,
         departures: formatDepartures(board)
+    });
+});
+
+// Calling pattern for a single service (rid), resolved to station names.
+// Used by the client to answer "does this train stop at X?".
+app.get('/api/service', (req, res) => {
+    const rid = (req.query.rid || '').toString().trim();
+    const pts = ridToCalling.get(rid);
+    if (!pts || !pts.length) return res.json({ rid, callingPoints: [] });
+    res.json({
+        rid,
+        callingPoints: pts.map(p => ({
+            name: nameForTiploc(p.tpl) || p.tpl,
+            crs: tiplocToCrs(p.tpl) || null,
+            time: p.t,
+            cancelled: !!p.can
+        }))
     });
 });
 

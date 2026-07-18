@@ -325,6 +325,8 @@ const lineStatus = {
 const serviceMessages = [];
 const recentStations = new Set();
 const sampleMessages = [];
+const msgTypeCounts = {};      // DIAGNOSTIC: tally of uR.* message types seen
+let formationSample = null;    // DIAGNOSTIC: first formation/loading message captured
 
 // rid -> terminus TIPLOC: populated by processSchedule DT nodes so that TS
 // messages arriving before their schedule can still resolve their destination.
@@ -431,7 +433,17 @@ function getCrowdingLevel(stationCode, date = new Date()) {
 }
 
 function getExitAdvice(destination, fromStation) {
-    return EXIT_POSITIONING[destination.toLowerCase()]?.[fromStation] || null;
+    if (!destination || !fromStation) return null;
+    const dn = destination.toLowerCase();
+    // Fuzzy: board destinations are full names ("London Victoria") but the dataset
+    // is keyed by short names ("victoria"). Match on containment either way.
+    for (const key of Object.keys(EXIT_POSITIONING)) {
+        if (dn === key || dn.includes(key) || key.includes(dn)) {
+            const adv = EXIT_POSITIONING[key][fromStation];
+            if (adv) return adv;
+        }
+    }
+    return null;
 }
 
 function getConnectionRisk(destination, connectionLine, bufferMins) {
@@ -521,6 +533,12 @@ function processDarwinMessage(message) {
         }
 
         if (data.uR) {
+            // DIAGNOSTIC: tally uR.* message types so we can see whether formation /
+            // loading data actually flows in this feed (for the coach-loading feature).
+            for (const k of Object.keys(data.uR)) msgTypeCounts[k] = (msgTypeCounts[k] || 0) + 1;
+            if (!formationSample && (data.uR.scheduleFormations || data.uR.formationLoading)) {
+                formationSample = JSON.stringify(data.uR.scheduleFormations || data.uR.formationLoading).substring(0, 1200);
+            }
             if (data.uR.TS) {
                 const arr = Array.isArray(data.uR.TS) ? data.uR.TS : [data.uR.TS];
                 arr.forEach(ts => processTrainStatus(ts));
@@ -707,7 +725,7 @@ async function startKafkaConsumer() {
 // ============================================
 // FORMATTING
 // ============================================
-function formatDepartures(deps) {
+function formatDepartures(deps, originCrs) {
     return (deps || []).map(d => {
         // Last-chance destination lookup: schedule messages may arrive after TS updates,
         // so the ridToDestination map may now have a TIPLOC that wasn't set at ingest time.
@@ -724,7 +742,9 @@ function formatDepartures(deps) {
             cancelled: d.cancelled || false,
             delayed: d.delayed || false,
             reason,
-            rid: d.rid || null   // lets the client fetch this service's calling pattern
+            rid: d.rid || null,   // lets the client fetch this service's calling pattern
+            // "Which carriage" boarding advice (curated), when we know the origin station.
+            exitAdvice: (originCrs && destination) ? getExitAdvice(destination, originCrs) : null
         };
     });
 }
@@ -754,7 +774,7 @@ app.get('/api/board', (req, res) => {
         timestamp: new Date(), lastUpdate,
         station: { crs, name: rec.name, lat: rec.lat, lon: rec.lon },
         warming: board.length === 0,
-        departures: formatDepartures(board)
+        departures: formatDepartures(board, crs)
     });
 });
 
@@ -779,7 +799,7 @@ app.get('/api/departures', (req, res) => {
     const stations = {};
     SEED_CRS.forEach(crs => {
         const rec = refByCrs.get(crs) || { name: crs };
-        stations[crs] = { name: rec.name, line: SE20_LINES[crs] || '', walkMins: SE20_WALK[crs] || null, departures: formatDepartures(departures[crs] || []) };
+        stations[crs] = { name: rec.name, line: SE20_LINES[crs] || '', walkMins: SE20_WALK[crs] || null, departures: formatDepartures(departures[crs] || [], crs) };
     });
     res.json({ timestamp: new Date(), lastUpdate, stations });
 });
@@ -791,7 +811,7 @@ app.get('/api/departures/:station', (req, res) => {
     const rec = refByCrs.get(crs);
     res.json({
         timestamp: new Date(), lastUpdate,
-        station: { code: crs, name: rec.name, line: SE20_LINES[crs] || '', walkMins: SE20_WALK[crs] || null, departures: formatDepartures(departures[crs] || []) }
+        station: { code: crs, name: rec.name, line: SE20_LINES[crs] || '', walkMins: SE20_WALK[crs] || null, departures: formatDepartures(departures[crs] || [], crs) }
     });
 });
 
@@ -970,6 +990,12 @@ app.get('/api/status', (req, res) => {
 
 app.get('/api/debug/samples', (req, res) => {
     res.json({ messageCount, sampleMessages });
+});
+
+// DIAGNOSTIC: which uR.* message types are flowing + a captured formation sample.
+// Tells us whether coach-loading data is available in this feed before we build on it.
+app.get('/api/debug/types', (req, res) => {
+    res.json({ messageCount, msgTypeCounts, formationSample });
 });
 
 app.get('/api/debug/stations', (req, res) => {

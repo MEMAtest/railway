@@ -439,10 +439,12 @@ function getCrowdingLevel(stationCode, date = new Date()) {
 function getExitAdvice(destination, fromStation) {
     if (!destination || !fromStation) return null;
     const dn = destination.toLowerCase();
-    // Fuzzy: board destinations are full names ("London Victoria") but the dataset
-    // is keyed by short names ("victoria"). Match on containment either way.
+    // Board destinations are full names ("London Victoria") but the dataset is keyed
+    // by short names ("victoria"), so match when the full name CONTAINS the key.
+    // Only the full→key direction (not key→full), to avoid a short destination like
+    // "Rye" falsely matching the key "peckham rye".
     for (const key of Object.keys(EXIT_POSITIONING)) {
-        if (dn === key || dn.includes(key) || key.includes(dn)) {
+        if (dn === key || dn.includes(key)) {
             const adv = EXIT_POSITIONING[key][fromStation];
             if (adv) return adv;
         }

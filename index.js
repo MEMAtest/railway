@@ -404,6 +404,42 @@ const ridToCalling = new Map();
 // formationLoading messages (TOC-dependent; ~a third of operators populate it).
 const ridLoading = new Map();
 
+// rid -> association (split/join/next-working) so a board departure can show
+// "🔀 Splits at X" / "🔗 Joins at X" / "➡️ Continues to Y". Keyed by both services.
+const ridAssoc = new Map();
+
+function processAssociation(a) {
+    if (!a || !a.main || !a.assoc || !a.tiploc) return;
+    const mainRid = a.main.rid, assocRid = a.assoc.rid;
+    if (!mainRid || !assocRid) return;
+    const entry = { tiploc: a.tiploc, category: a.category, mainRid, assocRid };
+    ridAssoc.set(mainRid, entry);
+    ridAssoc.set(assocRid, entry);
+    if (ridAssoc.size > 40000) {
+        const ks = [...ridAssoc.keys()];
+        ks.slice(0, 20000).forEach(k => ridAssoc.delete(k));
+    }
+}
+
+// Passenger-facing label for a service's association, resolved to station names.
+function associationLabel(rid) {
+    const e = ridAssoc.get(rid);
+    if (!e) return null;
+    const at = nameForTiploc(e.tiploc) || e.tiploc;
+    const otherRid = (rid === e.mainRid) ? e.assocRid : e.mainRid;
+    const otherDest = nameForTiploc(ridToDestination.get(otherRid));
+    if (e.category === 'VV' && rid === e.mainRid) {
+        return { kind: 'split', label: `🔀 Splits at ${at}${otherDest ? ` — a portion goes to ${otherDest}` : ''}` };
+    }
+    if (e.category === 'JJ') {
+        return { kind: 'join', label: `🔗 Joins another train at ${at}` };
+    }
+    if (e.category === 'NP' && rid === e.mainRid && otherDest) {
+        return { kind: 'continues', label: `➡️ Continues to ${otherDest}` };
+    }
+    return null;
+}
+
 let lastUpdate = null;
 let kafkaConnected = false;
 let messageCount = 0;
@@ -628,6 +664,10 @@ function processDarwinMessage(message) {
                 const arr = Array.isArray(data.uR.formationLoading) ? data.uR.formationLoading : [data.uR.formationLoading];
                 arr.forEach(fl => processFormationLoading(fl));
             }
+            if (data.uR.association) {
+                const arr = Array.isArray(data.uR.association) ? data.uR.association : [data.uR.association];
+                arr.forEach(a => processAssociation(a));
+            }
         }
         lastUpdate = new Date();
     } catch (e) { /* ignore malformed frames */ }
@@ -844,7 +884,9 @@ function formatDepartures(deps, originCrs) {
             // "Which carriage" boarding advice (curated), when we know the origin station.
             exitAdvice: (originCrs && destination) ? getExitAdvice(destination, originCrs) : null,
             // Per-coach loading at this station, when the operator publishes it.
-            loading: (originCrs && d.rid && ridLoading.has(`${d.rid}:${originCrs}`)) ? ridLoading.get(`${d.rid}:${originCrs}`) : null
+            loading: (originCrs && d.rid && ridLoading.has(`${d.rid}:${originCrs}`)) ? ridLoading.get(`${d.rid}:${originCrs}`) : null,
+            // Split / join / continues-as, when the service has an association.
+            association: d.rid ? associationLabel(d.rid) : null
         };
     });
 }

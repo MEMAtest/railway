@@ -402,6 +402,14 @@ let associationSample = null;  // DIAGNOSTIC: first association (split/join) mes
 // messages arriving before their schedule can still resolve their destination.
 const ridToDestination = new Map();
 
+// Half-clear the oldest ~half of a Map once it exceeds `max`, so a long-lived
+// consumer process never leaks (rids are service-day scoped — old ones are dead).
+function capMap(map, max) {
+    if (map.size <= max) return;
+    const keys = [...map.keys()];
+    keys.slice(0, Math.floor(max / 2)).forEach(k => map.delete(k));
+}
+
 // rid -> ordered calling pattern [{tpl, t, can}]: the full stop list from the
 // schedule (OR + IP + DT), so a departure can show "does this train stop at X?".
 const ridToCalling = new Map();
@@ -421,10 +429,7 @@ function processAssociation(a) {
     const entry = { tiploc: a.tiploc, category: a.category, mainRid, assocRid };
     ridAssoc.set(mainRid, entry);
     ridAssoc.set(assocRid, entry);
-    if (ridAssoc.size > 40000) {
-        const ks = [...ridAssoc.keys()];
-        ks.slice(0, 20000).forEach(k => ridAssoc.delete(k));
-    }
+    capMap(ridAssoc, 40000);
 }
 
 // Passenger-facing label for a service's association, resolved to station names.
@@ -717,12 +722,8 @@ function processSchedule(schedule) {
     // before the schedule message propagates to updateDeparture.
     if (destTpl && schedule.rid) {
         ridToDestination.set(schedule.rid, destTpl);
-        // Prevent unbounded growth. Half-clear (oldest 25k) instead of a full wipe so a
-        // thundering herd of "Unknown" destinations doesn't appear after an overflow.
-        if (ridToDestination.size > 50000) {
-            const keys = [...ridToDestination.keys()];
-            keys.slice(0, 25000).forEach(k => ridToDestination.delete(k));
-        }
+        // Half-clear on overflow (not a full wipe — avoids a thundering herd of "Unknown").
+        capMap(ridToDestination, 50000);
     }
 
     // Store the ordered calling pattern for this service (for "does it stop at X?").
@@ -732,10 +733,7 @@ function processSchedule(schedule) {
             t: p.ptd || p.pta || p.wtd || p.wta || '',
             can: p.can === 'true' || p.can === true
         })));
-        if (ridToCalling.size > 50000) {
-            const keys = [...ridToCalling.keys()];
-            keys.slice(0, 25000).forEach(k => ridToCalling.delete(k));
-        }
+        capMap(ridToCalling, 50000);
     }
 
     points.forEach(p => {
@@ -779,10 +777,7 @@ function processFormationLoading(fl) {
     })).filter(c => c.n != null && Number.isFinite(c.pct));
     if (!coaches.length) return;
     ridLoading.set(`${fl.rid}:${crs}`, coaches);
-    if (ridLoading.size > 30000) {
-        const keys = [...ridLoading.keys()];
-        keys.slice(0, 15000).forEach(k => ridLoading.delete(k));
-    }
+    capMap(ridLoading, 30000);
 }
 
 function keepEntry(d) {

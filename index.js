@@ -79,7 +79,13 @@ function maybeNotifyPush(crs, merged) {
 
 setInterval(() => {
     const now = Date.now();
-    for (const [ep, sub] of pushSubs) if (now - sub.createdAt > PUSH_TTL_MS) pushSubs.delete(ep);
+    for (const [ep, sub] of pushSubs) {
+        if (now - sub.createdAt > PUSH_TTL_MS) { pushSubs.delete(ep); continue; }
+        // Keep the tracked station "hot" so updateDeparture keeps firing for it — otherwise
+        // a station cools after HOT_TTL_MS and the platform-change push never fires when the
+        // user's tab is backgrounded (exactly when push matters).
+        if (sub.crs) markHot(sub.crs);
+    }
 }, 10 * 60 * 1000);
 
 // ============================================

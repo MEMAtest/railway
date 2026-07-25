@@ -390,6 +390,7 @@ const recentStations = new Set();
 const sampleMessages = [];
 const msgTypeCounts = {};      // DIAGNOSTIC: tally of uR.* message types seen
 let formationSample = null;    // DIAGNOSTIC: first formation/loading message captured
+let associationSample = null;  // DIAGNOSTIC: first association (split/join) message captured
 
 // rid -> terminus TIPLOC: populated by processSchedule DT nodes so that TS
 // messages arriving before their schedule can still resolve their destination.
@@ -607,6 +608,9 @@ function processDarwinMessage(message) {
             for (const k of Object.keys(data.uR)) msgTypeCounts[k] = (msgTypeCounts[k] || 0) + 1;
             if (!formationSample && (data.uR.scheduleFormations || data.uR.formationLoading)) {
                 formationSample = JSON.stringify(data.uR.scheduleFormations || data.uR.formationLoading).substring(0, 1200);
+            }
+            if (!associationSample && data.uR.association) {
+                associationSample = JSON.stringify(data.uR.association).substring(0, 1000);
             }
             if (data.uR.TS) {
                 const arr = Array.isArray(data.uR.TS) ? data.uR.TS : [data.uR.TS];
@@ -1119,7 +1123,7 @@ app.get('/api/debug/samples', (req, res) => {
 // DIAGNOSTIC: which uR.* message types are flowing + a captured formation sample.
 // Tells us whether coach-loading data is available in this feed before we build on it.
 app.get('/api/debug/types', (req, res) => {
-    res.json({ messageCount, msgTypeCounts, formationSample });
+    res.json({ messageCount, msgTypeCounts, formationSample, associationSample });
 });
 
 app.get('/api/debug/stations', (req, res) => {

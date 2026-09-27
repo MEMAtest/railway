@@ -916,7 +916,7 @@ async function fetchHuxleyBoard(crs) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 8000);
     try {
-        const res = await fetch(`${HUXLEY_URL}/departures/${encodeURIComponent(crs)}/15?expand=true`, { signal: ctrl.signal });
+        const res = await fetch(`${HUXLEY_URL}/departures/${encodeURIComponent(crs)}/40?expand=true`, { signal: ctrl.signal });
         if (!res.ok) throw new Error(`huxley ${res.status}`);
         const data = await res.json();
         const deps = (data.trainServices || []).map(s => {

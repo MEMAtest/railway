@@ -924,10 +924,14 @@ async function fetchHuxleyBoard(crs) {
             const after = (s.subsequentCallingPoints && s.subsequentCallingPoints[0] && s.subsequentCallingPoints[0].callingPoint) || [];
             if (rid) {
                 if (huxleyCalling.size > 5000) huxleyCalling.clear();
-                huxleyCalling.set(rid, after.map(c => ({
+                // Lead with the boarding station itself: Huxley lists only the
+                // stops AFTER it, but clients check "boards here, then calls at X"
+                // (the Kafka ridToCalling pattern includes the origin).
+                const origin = { name: data.locationName || crs, crs, time: s.std, cancelled: !!s.isCancelled };
+                huxleyCalling.set(rid, [origin, ...after.map(c => ({
                     name: c.locationName, crs: c.crs || null, time: c.st,
                     cancelled: !!c.isCancelled || c.et === 'Cancelled'
-                })));
+                }))]);
             }
             const destination = (s.destination && s.destination[0] && s.destination[0].locationName) || null;
             const cancelled = !!s.isCancelled || s.etd === 'Cancelled';

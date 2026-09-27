@@ -893,6 +893,68 @@ function formatDepartures(deps, originCrs) {
 }
 
 // ============================================
+// HUXLEY2 FALLBACK (no credentials)
+// ============================================
+// When the Darwin Kafka feed isn't connected (credentials missing, broker
+// down) or hasn't seen a station yet, serve the board from the public Huxley2
+// proxy of National Rail's OpenLDBWS instead of an empty "warming" board.
+// Same response shape as formatDepartures; rids are prefixed "hx:" so
+// /api/service can answer calling points from the cached expanded board.
+const HUXLEY_URL = process.env.HUXLEY_URL || 'https://huxley2.azurewebsites.net';
+const huxleyBoards = new Map();   // crs -> { at, deps }
+const huxleyCalling = new Map();  // "hx:<serviceID>" -> callingPoints[]
+const HUXLEY_TTL_MS = 30 * 1000;
+
+function huxleyExpected(std, etd) {
+    if (!etd || etd === 'On time') return std || null;
+    return /^\d{2}:\d{2}$/.test(etd) ? etd : null;   // "Delayed" / "Cancelled" -> unknown
+}
+
+async function fetchHuxleyBoard(crs) {
+    const hit = huxleyBoards.get(crs);
+    if (hit && Date.now() - hit.at < HUXLEY_TTL_MS) return hit.deps;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    try {
+        const res = await fetch(`${HUXLEY_URL}/departures/${encodeURIComponent(crs)}/15?expand=true`, { signal: ctrl.signal });
+        if (!res.ok) throw new Error(`huxley ${res.status}`);
+        const data = await res.json();
+        const deps = (data.trainServices || []).map(s => {
+            const rid = s.serviceID ? `hx:${s.serviceID}` : null;
+            const after = (s.subsequentCallingPoints && s.subsequentCallingPoints[0] && s.subsequentCallingPoints[0].callingPoint) || [];
+            if (rid) {
+                if (huxleyCalling.size > 5000) huxleyCalling.clear();
+                huxleyCalling.set(rid, after.map(c => ({
+                    name: c.locationName, crs: c.crs || null, time: c.st,
+                    cancelled: !!c.isCancelled || c.et === 'Cancelled'
+                })));
+            }
+            const destination = (s.destination && s.destination[0] && s.destination[0].locationName) || null;
+            const cancelled = !!s.isCancelled || s.etd === 'Cancelled';
+            const expectedTime = cancelled ? null : huxleyExpected(s.std, s.etd);
+            return {
+                destination,
+                scheduledTime: s.std || '',
+                expectedTime,
+                platform: s.platform || null,
+                mins: calculateMinutes(expectedTime || s.std),
+                cancelled,
+                delayed: !cancelled && s.etd !== 'On time' && expectedTime !== s.std,
+                reason: s.cancelReason || s.delayReason || null,
+                rid,
+                exitAdvice: destination ? getExitAdvice(destination, crs) : null,
+                loading: null,
+                association: null
+            };
+        });
+        huxleyBoards.set(crs, { at: Date.now(), deps });
+        return deps;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+// ============================================
 // REST API
 // ============================================
 app.get('/health', (req, res) => {
@@ -902,7 +964,7 @@ app.get('/health', (req, res) => {
     });
 });
 
-app.get('/api/board', (req, res) => {
+app.get('/api/board', async (req, res) => {
     let crs = (req.query.crs || '').toString().trim().toUpperCase();
     if (!crs && req.query.lat != null && req.query.lon != null) {
         crs = nearestCrs(parseFloat(req.query.lat), parseFloat(req.query.lon)) || '';
@@ -913,10 +975,20 @@ app.get('/api/board', (req, res) => {
     markHot(crs);
     const rec = refByCrs.get(crs);
     const board = departures[crs] || [];
+    const station = { crs, name: rec.name, lat: rec.lat, lon: rec.lon };
+    if (!kafkaConnected || board.length === 0) {
+        try {
+            const deps = await fetchHuxleyBoard(crs);
+            return res.json({ timestamp: new Date(), lastUpdate, station, warming: false, source: 'huxley', departures: deps });
+        } catch (e) {
+            console.warn(`Huxley fallback failed for ${crs}: ${e.message}`);
+            if (!kafkaConnected) return res.status(503).json({ error: 'Live trains unavailable', station });
+        }
+    }
     res.json({
-        timestamp: new Date(), lastUpdate,
-        station: { crs, name: rec.name, lat: rec.lat, lon: rec.lon },
+        timestamp: new Date(), lastUpdate, station,
         warming: board.length === 0,
+        source: 'darwin',
         departures: formatDepartures(board, crs)
     });
 });
@@ -953,6 +1025,7 @@ app.post('/api/push/unsubscribe', (req, res) => {
 // Used by the client to answer "does this train stop at X?".
 app.get('/api/service', (req, res) => {
     const rid = (req.query.rid || '').toString().trim();
+    if (rid.startsWith('hx:')) return res.json({ rid, callingPoints: huxleyCalling.get(rid) || [] });
     const pts = ridToCalling.get(rid);
     if (!pts || !pts.length) return res.json({ rid, callingPoints: [] });
     res.json({
